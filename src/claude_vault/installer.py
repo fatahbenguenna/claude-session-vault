@@ -8,6 +8,13 @@ from typing import Dict, Any
 
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
+MCP_SERVER_CONFIG = {
+    "claude-session-vault": {
+        "command": "claude-vault-mcp",
+        "args": []
+    }
+}
+
 HOOKS_CONFIG = {
     "SessionStart": [{
         "hooks": [{
@@ -114,6 +121,14 @@ def install_hooks(force: bool = False) -> bool:
 
     # Merge hooks
     settings['hooks'] = merge_hooks(existing_hooks, HOOKS_CONFIG)
+
+    # Add MCP server configuration
+    if 'mcpServers' not in settings:
+        settings['mcpServers'] = {}
+
+    if 'claude-session-vault' not in settings['mcpServers']:
+        settings['mcpServers']['claude-session-vault'] = MCP_SERVER_CONFIG['claude-session-vault']
+        print("✅ MCP server configured (vault_search, vault_sessions, vault_stats tools)")
 
     # Save
     save_settings(settings)

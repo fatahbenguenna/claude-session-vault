@@ -32,6 +32,7 @@ dependencies = [
 claude-vault = "claude_vault.cli:main"
 claude-vault-hook = "claude_vault.hooks:main"
 claude-vault-install = "claude_vault.installer:main"
+claude-vault-mcp = "claude_vault.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/fatahbenguenna/claude-session-vault"
