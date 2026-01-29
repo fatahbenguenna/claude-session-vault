@@ -128,27 +128,30 @@ def search(query: str, limit: int, session: Optional[str], event_type: Optional[
         return
 
     table = Table(title=f"Search Results for '{query}'", box=box.ROUNDED)
+    table.add_column("Session", style="magenta", width=8)
     table.add_column("Time", style="dim", width=19)
     table.add_column("Project", style="cyan", width=15)
-    table.add_column("Type", style="green", width=18)
-    table.add_column("Tool/Prompt", style="yellow", max_width=50)
+    table.add_column("Type", style="green", width=15)
+    table.add_column("Content", style="yellow", max_width=40)
 
     for r in results:
+        session_id = r.get('session_id', '')[:8] if r.get('session_id') else '-'
         timestamp = r.get('timestamp', '')[:19] if r.get('timestamp') else ''
         project = r.get('project_name', '-')[:15] if r.get('project_name') else '-'
-        event_type = r.get('event_type', '-')
+        evt_type = r.get('event_type', '-')
 
         # Show relevant content based on event type
         content = ''
         if r.get('tool_name'):
             content = r['tool_name']
         elif r.get('prompt'):
-            content = r['prompt'][:50] + '...' if len(r.get('prompt', '')) > 50 else r.get('prompt', '')
+            prompt = r.get('prompt', '')
+            content = prompt[:40] + '...' if len(prompt) > 40 else prompt
 
-        table.add_row(timestamp, project, event_type, content)
+        table.add_row(session_id, timestamp, project, evt_type, content)
 
     console.print(table)
-    console.print(f"\n[dim]Found {len(results)} results[/dim]")
+    console.print(f"\n[dim]Found {len(results)} results. Use 'claude-vault export <session-id>' to export.[/dim]")
 
 
 @main.command()
