@@ -739,5 +739,154 @@ def version():
     console.print(f"claude-session-vault [cyan]v{__version__}[/cyan]")
 
 
+@main.command()
+@click.option("-p", "--project", default=None, help="Filter by project name")
+def browse(project: Optional[str]):
+    """Interactive TUI to browse and search sessions (like claude --resume).
+
+    \b
+    Features:
+        - Fuzzy search through all sessions
+        - Preview session details
+        - Export selected session
+        - Navigate with arrow keys
+
+    \b
+    Examples:
+        claude-vault browse
+        claude-vault browse --project fps-api
+    """
+    try:
+        from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
+        from InquirerPy.separator import Separator
+    except ImportError:
+        console.print("[red]InquirerPy not installed. Run: pip install InquirerPy[/red]")
+        return
+
+    # Load sessions
+    sessions_data = list_sessions(limit=100, project_filter=project)
+
+    if not sessions_data:
+        console.print("[yellow]No sessions found in vault[/yellow]")
+        return
+
+    def get_session_preview(session_id: str) -> str:
+        """Generate a preview of the session for display."""
+        events = get_session_events(session_id, limit=5)
+        if not events:
+            return "No events found"
+
+        lines = []
+        for e in events[:5]:
+            evt_type = e.get('event_type', '')
+            if evt_type == 'UserPromptSubmit' and e.get('prompt'):
+                prompt = e['prompt'][:100].replace('\n', ' ')
+                lines.append(f"👤 {prompt}...")
+            elif e.get('tool_name'):
+                lines.append(f"⚡ {e['tool_name']}")
+        return '\n'.join(lines) if lines else "No preview available"
+
+    # Build choices for fuzzy selector
+    choices = []
+    for s in sessions_data:
+        sid = s.get('session_id', '')
+        project_name = s.get('project_name', 'Unknown')[:25]
+        event_count = s.get('event_count', 0)
+        last_activity = s.get('last_activity', '')[:10] if s.get('last_activity') else ''
+
+        # Display format: "project - date (N events)"
+        display = f"{project_name} - {last_activity} ({event_count} events)"
+
+        choices.append(Choice(value=sid, name=display))
+
+    console.print("\n[bold cyan]Claude Session Vault[/bold cyan] - Interactive Browser\n")
+    console.print("[dim]Type to search, ↑↓ to navigate, Enter to select, Ctrl+C to exit[/dim]\n")
+
+    try:
+        # Main session selection with fuzzy search
+        selected_session = inquirer.fuzzy(
+            message="Select a session:",
+            choices=choices,
+            max_height="70%",
+            validate=lambda x: x is not None,
+            invalid_message="Please select a session",
+            transformer=lambda x: f"📁 {x}",
+        ).execute()
+
+        if not selected_session:
+            return
+
+        # Find session info
+        session_info = next((s for s in sessions_data if s.get('session_id') == selected_session), None)
+        project_name = session_info.get('project_name', 'Unknown') if session_info else 'Unknown'
+
+        # Show preview
+        console.print(f"\n[bold]Selected:[/bold] [magenta]{selected_session[:12]}[/magenta] ({project_name})")
+        console.print("\n[dim]Preview:[/dim]")
+        preview = get_session_preview(selected_session)
+        console.print(Panel(preview, border_style="dim"))
+
+        # Action selection
+        action = inquirer.select(
+            message="What would you like to do?",
+            choices=[
+                Choice(value="show", name="📋 Show full session"),
+                Choice(value="export_md", name="📝 Export to Markdown"),
+                Choice(value="export_json", name="📦 Export to JSON"),
+                Choice(value="search", name="🔍 Search within this session"),
+                Separator(),
+                Choice(value="back", name="← Back to session list"),
+                Choice(value="exit", name="✖ Exit"),
+            ],
+        ).execute()
+
+        ctx = click.get_current_context()
+
+        if action == "show":
+            ctx.invoke(show, session_id=selected_session, limit=100, as_json=False, prompts_only=False, tools_only=False)
+
+        elif action == "export_md":
+            default_name = f"session-{selected_session[:8]}.md"
+            filename = inquirer.text(
+                message="Output filename:",
+                default=default_name,
+            ).execute()
+            ctx.invoke(export, output_path=filename, session=selected_session, fmt='md')
+
+        elif action == "export_json":
+            default_name = f"session-{selected_session[:8]}.json"
+            filename = inquirer.text(
+                message="Output filename:",
+                default=default_name,
+            ).execute()
+            ctx.invoke(export, output_path=filename, session=selected_session, fmt='json')
+
+        elif action == "search":
+            query = inquirer.text(
+                message="Search query:",
+                validate=lambda x: len(x) > 0,
+                invalid_message="Query cannot be empty",
+            ).execute()
+            results = search_events(query, limit=50, session_id=selected_session)
+            if results:
+                console.print(f"\n[green]Found {len(results)} results[/green]\n")
+                for r in results[:10]:
+                    evt_type = r.get('event_type', '')
+                    content = r.get('tool_name') or (r.get('prompt', '')[:60] + '...' if r.get('prompt') else '')
+                    console.print(f"  • [yellow]{evt_type}[/yellow]: {content}")
+            else:
+                console.print(f"[yellow]No results for '{query}'[/yellow]")
+
+        elif action == "back":
+            # Recursive call to restart
+            ctx.invoke(browse, project=project)
+
+    except KeyboardInterrupt:
+        console.print("\n[dim]Cancelled[/dim]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
 if __name__ == "__main__":
     main()
