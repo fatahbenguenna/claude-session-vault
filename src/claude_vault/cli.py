@@ -5,7 +5,7 @@ import json
 import click
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from rich.console import Console
 from rich.table import Table
@@ -26,7 +26,63 @@ from claude_vault.db import (
 console = Console()
 
 
-@click.group()
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Calculate the Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    return previous_row[-1]
+
+
+def find_similar_commands(cmd: str, commands: List[str], max_distance: int = 2) -> List[str]:
+    """Find similar commands based on Levenshtein distance."""
+    suggestions = []
+    for command in commands:
+        distance = levenshtein_distance(cmd.lower(), command.lower())
+        if distance <= max_distance:
+            suggestions.append((command, distance))
+
+    # Sort by distance and return command names
+    suggestions.sort(key=lambda x: x[1])
+    return [s[0] for s in suggestions]
+
+
+class SuggestingGroup(click.Group):
+    """Custom Click Group that suggests similar commands on typos."""
+
+    def resolve_command(self, ctx, args):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as e:
+            # Command not found, try to suggest
+            if args:
+                cmd_name = args[0]
+                available_commands = list(self.commands.keys())
+                suggestions = find_similar_commands(cmd_name, available_commands)
+
+                if suggestions:
+                    suggestion = suggestions[0]
+                    console.print(f"\n[red]Error:[/red] '{cmd_name}' is not a valid command.\n")
+                    console.print(f"[yellow]Did you mean:[/yellow] [green]claude-vault {suggestion}[/green] ?\n")
+                    console.print(f"[dim]Available commands: {', '.join(available_commands)}[/dim]\n")
+                    ctx.exit(1)
+            raise
+
+
+@click.group(cls=SuggestingGroup)
 @click.version_option(version="1.0.0")
 def main():
     """Claude Session Vault - Search and browse your Claude Code history.
