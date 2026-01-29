@@ -537,5 +537,69 @@ def path():
         console.print("[yellow]Database not yet created[/yellow]")
 
 
+@main.command()
+def update():
+    """Update claude-session-vault to the latest version from GitHub."""
+    import subprocess
+    import shutil
+
+    console.print("[bold]Updating Claude Session Vault...[/bold]\n")
+
+    # Check for pipx
+    pipx_path = shutil.which("pipx")
+    if pipx_path:
+        console.print("[dim]Using pipx...[/dim]")
+        result = subprocess.run(
+            ["pipx", "install", "git+https://github.com/fatahbenguenna/claude-session-vault.git", "--force"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            console.print("[green]✅ Updated successfully![/green]")
+            console.print("[dim]Restart your terminal to use the new version.[/dim]")
+        else:
+            console.print(f"[red]Update failed:[/red]\n{result.stderr}")
+        return
+
+    # Check for uv
+    uv_path = shutil.which("uv")
+    if uv_path:
+        console.print("[dim]Using uv...[/dim]")
+        result = subprocess.run(
+            ["uv", "tool", "install", "git+https://github.com/fatahbenguenna/claude-session-vault.git", "--force"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            console.print("[green]✅ Updated successfully![/green]")
+        else:
+            console.print(f"[red]Update failed:[/red]\n{result.stderr}")
+        return
+
+    # Fallback to pip
+    pip_path = shutil.which("pip3") or shutil.which("pip")
+    if pip_path:
+        console.print("[dim]Using pip...[/dim]")
+        result = subprocess.run(
+            [pip_path, "install", "--user", "--upgrade", "git+https://github.com/fatahbenguenna/claude-session-vault.git"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            console.print("[green]✅ Updated successfully![/green]")
+        else:
+            console.print(f"[red]Update failed:[/red]\n{result.stderr}")
+        return
+
+    console.print("[red]No package manager found (pipx, uv, or pip)[/red]")
+
+
+@main.command()
+def version():
+    """Show the current version."""
+    from claude_vault import __version__
+    console.print(f"claude-session-vault [cyan]v{__version__}[/cyan]")
+
+
 if __name__ == "__main__":
     main()

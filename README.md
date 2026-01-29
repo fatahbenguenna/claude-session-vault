@@ -105,11 +105,21 @@ claude-vault stats
 claude-vault stats --json
 ```
 
+### Update
+
+```bash
+# Update to latest version from GitHub
+claude-vault update
+```
+
 ### Other commands
 
 ```bash
 # Show database path
 claude-vault path
+
+# Show current version
+claude-vault version
 
 # Show installation instructions
 claude-vault install
