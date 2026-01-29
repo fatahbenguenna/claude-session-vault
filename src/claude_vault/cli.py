@@ -108,7 +108,8 @@ def main():
 @click.option("-s", "--session", default=None, help="Filter by session ID")
 @click.option("-t", "--type", "event_type", default=None, help="Filter by event type")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-def search(query: str, limit: int, session: Optional[str], event_type: Optional[str], as_json: bool):
+@click.option("-i", "--interactive", is_flag=True, help="Interactive mode: choose session to show/export")
+def search(query: str, limit: int, session: Optional[str], event_type: Optional[str], as_json: bool, interactive: bool):
     """Full-text search across all sessions.
 
     \b
@@ -116,6 +117,7 @@ def search(query: str, limit: int, session: Optional[str], event_type: Optional[
         claude-vault search "login bug"
         claude-vault search "Edit" --type PostToolUse
         claude-vault search "database" --session abc123
+        claude-vault search "auth" -i   # Interactive mode
     """
     results = search_events(query, limit=limit, session_id=session, event_type=event_type)
 
@@ -127,12 +129,31 @@ def search(query: str, limit: int, session: Optional[str], event_type: Optional[
         click.echo(json.dumps(results, indent=2, default=str))
         return
 
+    # Extract unique sessions (preserving order of first occurrence)
+    unique_sessions = []
+    seen_sessions = set()
+    for r in results:
+        sid = r.get('session_id', '')
+        if sid and sid not in seen_sessions:
+            seen_sessions.add(sid)
+            unique_sessions.append({
+                'session_id': sid,
+                'project_name': r.get('project_name', '-'),
+                'timestamp': r.get('timestamp', '')
+            })
+
     table = Table(title=f"Search Results for '{query}'", box=box.ROUNDED)
+    if interactive:
+        table.add_column("#", style="bold white", width=3)
     table.add_column("Session", style="magenta", width=8)
     table.add_column("Time", style="dim", width=19)
     table.add_column("Project", style="cyan", width=15)
     table.add_column("Type", style="green", width=15)
     table.add_column("Content", style="yellow", max_width=40)
+
+    # Map row index to session for interactive mode
+    row_to_session = {}
+    row_idx = 0
 
     for r in results:
         session_id = r.get('session_id', '')[:8] if r.get('session_id') else '-'
@@ -148,10 +169,64 @@ def search(query: str, limit: int, session: Optional[str], event_type: Optional[
             prompt = r.get('prompt', '')
             content = prompt[:40] + '...' if len(prompt) > 40 else prompt
 
-        table.add_row(session_id, timestamp, project, evt_type, content)
+        if interactive:
+            row_idx += 1
+            row_to_session[row_idx] = r.get('session_id', '')
+            table.add_row(str(row_idx), session_id, timestamp, project, evt_type, content)
+        else:
+            table.add_row(session_id, timestamp, project, evt_type, content)
 
     console.print(table)
-    console.print(f"\n[dim]Found {len(results)} results. Use 'claude-vault export <session-id>' to export.[/dim]")
+
+    if interactive and unique_sessions:
+        console.print(f"\n[dim]Found {len(results)} results in {len(unique_sessions)} sessions.[/dim]\n")
+
+        # Show unique sessions menu
+        console.print("[bold]Sessions found:[/bold]")
+        for idx, s in enumerate(unique_sessions, 1):
+            sid_short = s['session_id'][:8]
+            proj = s['project_name'][:20] if s['project_name'] else '-'
+            console.print(f"  [bold white]{idx}[/bold white]. [magenta]{sid_short}[/magenta] - [cyan]{proj}[/cyan]")
+
+        console.print(f"\n  [dim]0. Exit[/dim]")
+
+        try:
+            choice = click.prompt("\nSelect session number", type=int, default=0)
+
+            if choice == 0:
+                return
+
+            if 1 <= choice <= len(unique_sessions):
+                selected = unique_sessions[choice - 1]
+                sid = selected['session_id']
+
+                console.print(f"\n[bold]Selected:[/bold] [magenta]{sid[:8]}[/magenta]\n")
+                console.print("  [bold white]1[/bold white]. Show session details")
+                console.print("  [bold white]2[/bold white]. Export to Markdown")
+                console.print("  [bold white]3[/bold white]. Export to JSON")
+                console.print("  [dim]0. Cancel[/dim]")
+
+                action = click.prompt("\nAction", type=int, default=0)
+
+                if action == 1:
+                    # Invoke show command
+                    ctx = click.get_current_context()
+                    ctx.invoke(show, session_id=sid, limit=100, as_json=False, prompts_only=False, tools_only=False)
+                elif action == 2:
+                    filename = click.prompt("Output file", default=f"session-{sid[:8]}.md")
+                    ctx = click.get_current_context()
+                    ctx.invoke(export, output_path=filename, session=sid, fmt='md')
+                elif action == 3:
+                    filename = click.prompt("Output file", default=f"session-{sid[:8]}.json")
+                    ctx = click.get_current_context()
+                    ctx.invoke(export, output_path=filename, session=sid, fmt='json')
+            else:
+                console.print("[red]Invalid selection[/red]")
+
+        except (click.Abort, KeyboardInterrupt):
+            console.print("\n[dim]Cancelled[/dim]")
+    else:
+        console.print(f"\n[dim]Found {len(results)} results. Use 'claude-vault export <session-id>' to export.[/dim]")
 
 
 @main.command()
