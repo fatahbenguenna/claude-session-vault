@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-session-vault"
+version = "1.0.0"
+description = "Persist and search Claude Code sessions in SQLite"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Fatah Benguenna" }
+]
+keywords = ["claude", "claude-code", "session", "history", "sqlite"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+    "tabulate>=0.9",
+]
+
+[project.scripts]
+claude-vault = "claude_vault.cli:main"
+claude-vault-hook = "claude_vault.hooks:main"
+claude-vault-install = "claude_vault.installer:main"
+
+[project.urls]
+Homepage = "https://github.com/fatahbenguenna/claude-session-vault"
+Repository = "https://github.com/fatahbenguenna/claude-session-vault"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_vault"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/README.md",
+]
