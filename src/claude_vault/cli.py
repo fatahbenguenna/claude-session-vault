@@ -269,6 +269,22 @@ def export(output_path: str, session: str, fmt: str):
     """
     events = get_session_events(session, limit=10000)
 
+    # Try partial match if no results
+    if not events:
+        from claude_vault.db import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT session_id FROM sessions WHERE session_id LIKE ? LIMIT 1",
+            (f"{session}%",)
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            session = row[0]
+            events = get_session_events(session, limit=10000)
+
     if not events:
         console.print(f"[red]Session '{session}' not found[/red]")
         return
