@@ -86,20 +86,30 @@ class SuggestingGroup(click.Group):
             raise
 
 
-@click.group(cls=SuggestingGroup)
+@click.group(cls=SuggestingGroup, invoke_without_command=True)
 @click.version_option(version="1.0.0")
-def main():
+@click.pass_context
+def main(ctx):
     """Claude Session Vault - Search and browse your Claude Code history.
 
     \b
+    Running 'claude-vault' without arguments opens the interactive browser.
+
+    \b
     Examples:
-        claude-vault search "authentication"
-        claude-vault sessions --project fps-api
-        claude-vault show abc123
-        claude-vault stats
+        claude-vault                      # Opens interactive browser
+        claude-vault browse               # Same as above
+        claude-vault search "auth"        # Search sessions
+        claude-vault sessions             # List all sessions
+        claude-vault show abc123          # Show session details
+        claude-vault stats                # Usage statistics
     """
     # Ensure DB is initialized
     init_db()
+
+    # If no subcommand given, invoke browse
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(browse)
 
 
 @main.command()
