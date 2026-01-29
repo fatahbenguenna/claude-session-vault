@@ -73,12 +73,16 @@ class SuggestingGroup(click.Group):
                 available_commands = list(self.commands.keys())
                 suggestions = find_similar_commands(cmd_name, available_commands)
 
+                console.print(f"\n[red]Error:[/red] '{cmd_name}' is not a valid command.\n")
+
                 if suggestions:
                     suggestion = suggestions[0]
-                    console.print(f"\n[red]Error:[/red] '{cmd_name}' is not a valid command.\n")
                     console.print(f"[yellow]Did you mean:[/yellow] [green]claude-vault {suggestion}[/green] ?\n")
-                    console.print(f"[dim]Available commands: {', '.join(available_commands)}[/dim]\n")
-                    ctx.exit(1)
+                else:
+                    console.print("[yellow]No similar command found.[/yellow]\n")
+
+                console.print(f"[dim]Available commands: {', '.join(sorted(available_commands))}[/dim]\n")
+                ctx.exit(1)
             raise
 
 
