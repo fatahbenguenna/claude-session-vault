@@ -255,64 +255,202 @@ def stats(as_json: bool):
             console.print(f"  [yellow]{tool}[/yellow]: {count} uses")
 
 
+def parse_jsonl_transcript(transcript_path: str) -> list:
+    """Parse a Claude Code JSONL transcript file into conversation format."""
+    messages = []
+    transcript = Path(transcript_path)
+
+    if not transcript.exists():
+        return []
+
+    with open(transcript, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                msg_type = entry.get('type')
+
+                if msg_type == 'user':
+                    # User message
+                    message = entry.get('message', {})
+                    content = message.get('content', '')
+                    if isinstance(content, list):
+                        # Extract text from content blocks
+                        content = '\n'.join(
+                            block.get('text', '') for block in content
+                            if isinstance(block, dict) and block.get('type') == 'text'
+                        )
+                    if content:
+                        messages.append({
+                            'role': 'user',
+                            'content': content,
+                            'timestamp': entry.get('timestamp', '')
+                        })
+
+                elif msg_type == 'assistant':
+                    # Assistant message
+                    message = entry.get('message', {})
+                    content_blocks = message.get('content', [])
+
+                    text_parts = []
+                    tool_uses = []
+
+                    for block in content_blocks:
+                        if isinstance(block, dict):
+                            if block.get('type') == 'text':
+                                text_parts.append(block.get('text', ''))
+                            elif block.get('type') == 'tool_use':
+                                tool_uses.append({
+                                    'name': block.get('name', 'unknown'),
+                                    'input': block.get('input', {})
+                                })
+
+                    if text_parts or tool_uses:
+                        messages.append({
+                            'role': 'assistant',
+                            'content': '\n'.join(text_parts),
+                            'tool_uses': tool_uses,
+                            'timestamp': entry.get('timestamp', '')
+                        })
+
+                elif msg_type == 'tool_result':
+                    # Tool result - we can skip these in export or include as collapsed
+                    pass
+
+            except json.JSONDecodeError:
+                continue
+
+    return messages
+
+
 @main.command()
 @click.argument("output_path", type=click.Path())
 @click.option("-s", "--session", required=True, help="Session ID to export")
 @click.option("-f", "--format", "fmt", type=click.Choice(['json', 'md', 'txt']), default='md')
 def export(output_path: str, session: str, fmt: str):
-    """Export a session to a file.
+    """Export a session to a file (reads full transcript for complete conversation).
 
     \b
     Examples:
         claude-vault export session.md --session abc123
         claude-vault export session.json --session abc123 --format json
     """
-    events = get_session_events(session, limit=10000)
+    from claude_vault.db import get_connection
 
-    # Try partial match if no results
-    if not events:
-        from claude_vault.db import get_connection
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT session_id FROM sessions WHERE session_id LIKE ? LIMIT 1",
-            (f"{session}%",)
-        )
+    # Find full session ID and transcript path
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Try exact match first, then partial
+    cursor.execute("""
+        SELECT e.session_id, e.transcript_path, s.project_name
+        FROM events e
+        LEFT JOIN sessions s ON e.session_id = s.session_id
+        WHERE e.session_id = ? AND e.transcript_path IS NOT NULL
+        LIMIT 1
+    """, (session,))
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.execute("""
+            SELECT e.session_id, e.transcript_path, s.project_name
+            FROM events e
+            LEFT JOIN sessions s ON e.session_id = s.session_id
+            WHERE e.session_id LIKE ? AND e.transcript_path IS NOT NULL
+            LIMIT 1
+        """, (f"{session}%",))
         row = cursor.fetchone()
-        conn.close()
 
-        if row:
-            session = row[0]
-            events = get_session_events(session, limit=10000)
+    conn.close()
 
-    if not events:
+    if not row:
         console.print(f"[red]Session '{session}' not found[/red]")
         return
 
+    full_session_id = row[0]
+    transcript_path = row[1]
+    project_name = row[2] or "Unknown Project"
+
     output = Path(output_path)
 
+    # Try to parse the JSONL transcript for full conversation
+    messages = []
+    if transcript_path:
+        messages = parse_jsonl_transcript(transcript_path)
+
     if fmt == 'json':
-        output.write_text(json.dumps(events, indent=2, default=str))
+        output.write_text(json.dumps(messages, indent=2, default=str, ensure_ascii=False))
+        console.print(f"[green]Exported {len(messages)} messages to {output_path}[/green]")
+        return
 
     elif fmt == 'md':
-        lines = [f"# Claude Session: {session}\n"]
-        for e in events:
-            timestamp = e.get('timestamp', '')[:19]
-            event_type = e.get('event_type', '')
+        lines = [
+            f"# Claude Code Session",
+            f"",
+            f"**Project:** {project_name}",
+            f"**Session ID:** `{full_session_id}`",
+            f"",
+            f"---",
+            f""
+        ]
 
-            if event_type == 'UserPromptSubmit' and e.get('prompt'):
-                lines.append(f"\n## User Prompt ({timestamp})\n")
-                lines.append(e['prompt'])
-                lines.append("\n")
+        for msg in messages:
+            timestamp = msg.get('timestamp', '')[:19].replace('T', ' ')
+            role = msg.get('role', 'unknown')
 
-            elif e.get('tool_name'):
-                lines.append(f"\n### Tool: {e['tool_name']} ({timestamp})\n")
-                if e.get('tool_input'):
-                    lines.append("```json\n")
-                    lines.append(e['tool_input'][:1000])
-                    lines.append("\n```\n")
+            if role == 'user':
+                lines.append(f"## 👤 User")
+                if timestamp:
+                    lines.append(f"*{timestamp}*")
+                lines.append("")
+                lines.append(msg.get('content', ''))
+                lines.append("")
 
-        output.write_text('\n'.join(lines))
+            elif role == 'assistant':
+                lines.append(f"## 🤖 Assistant")
+                if timestamp:
+                    lines.append(f"*{timestamp}*")
+                lines.append("")
+
+                content = msg.get('content', '')
+                if content:
+                    lines.append(content)
+                    lines.append("")
+
+                # Show tool uses
+                tool_uses = msg.get('tool_uses', [])
+                if tool_uses:
+                    for tool in tool_uses:
+                        tool_name = tool.get('name', 'unknown')
+                        tool_input = tool.get('input', {})
+                        lines.append(f"**Tool:** `{tool_name}`")
+
+                        # Format tool input nicely
+                        if isinstance(tool_input, dict):
+                            if tool_name == 'Bash' and 'command' in tool_input:
+                                lines.append(f"```bash")
+                                lines.append(tool_input['command'])
+                                lines.append(f"```")
+                            elif tool_name in ('Read', 'Write', 'Edit', 'Glob', 'Grep'):
+                                lines.append(f"```")
+                                for k, v in tool_input.items():
+                                    if isinstance(v, str) and len(v) > 200:
+                                        v = v[:200] + "..."
+                                    lines.append(f"{k}: {v}")
+                                lines.append(f"```")
+                            else:
+                                lines.append(f"```json")
+                                lines.append(json.dumps(tool_input, indent=2, ensure_ascii=False)[:500])
+                                lines.append(f"```")
+                        lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+        output.write_text('\n'.join(lines), encoding='utf-8')
+        console.print(f"[green]Exported {len(messages)} messages to {output_path}[/green]")
+        return
 
     else:  # txt
         lines = []
