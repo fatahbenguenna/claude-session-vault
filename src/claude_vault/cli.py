@@ -1281,38 +1281,41 @@ def browse(ctx, project: Optional[str]):
                     # Simple decode for common case (no underscores in path)
                     return encoded_name.replace('-', '/')
 
-                # Strategy 1: Use transcript_path from session
-                transcript_path = session.get('transcript_path')
-                project_dir = None
+                def find_session_file(sid: str, tp: Optional[str] = None):
+                    """Find the JSONL file for a session. Returns (file_path, project_dir) or (None, None)."""
+                    # Strategy 1: Use transcript_path if provided and exists
+                    if tp and Path(tp).exists():
+                        parent_name = Path(tp).parent.name
+                        proj_dir = decode_project_path(parent_name)
+                        return tp, proj_dir
 
-                if transcript_path:
-                    parent_name = Path(transcript_path).parent.name
-                    project_dir = decode_project_path(parent_name)
-
-                # Strategy 2: Find JSONL file in Claude's projects directory
-                if not project_dir or not Path(project_dir).exists():
+                    # Strategy 2: Search in Claude's projects directory
                     claude_projects = Path.home() / ".claude" / "projects"
                     if claude_projects.exists():
-                        for jsonl_file in claude_projects.rglob(f"{session_id}.jsonl"):
+                        for jsonl_file in claude_projects.rglob(f"{sid}.jsonl"):
                             parent_name = jsonl_file.parent.name
-                            project_dir = decode_project_path(parent_name)
-                            break
+                            proj_dir = decode_project_path(parent_name)
+                            return str(jsonl_file), proj_dir
 
-                # Strategy 3: Try events table
-                if not project_dir or not Path(project_dir).exists():
-                    from claude_vault.db import get_connection
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT transcript_path FROM events
-                        WHERE session_id = ? AND transcript_path IS NOT NULL
-                        LIMIT 1
-                    """, (session_id,))
-                    row = cursor.fetchone()
-                    if row:
-                        parent_name = Path(row[0]).parent.name
-                        project_dir = decode_project_path(parent_name)
-                    conn.close()
+                    return None, None
+
+                # Find the session file
+                transcript_path = session.get('transcript_path')
+                jsonl_file, project_dir = find_session_file(session_id, transcript_path)
+
+                # Check if file exists
+                if not jsonl_file:
+                    console.print("")
+                    console.print("[red]╭─────────────────────────────────────────────────────╮[/red]")
+                    console.print("[red]│ Cannot open session in Claude Code                  │[/red]")
+                    console.print("[red]│                                                     │[/red]")
+                    console.print("[red]│ The session file has been deleted by Claude.        │[/red]")
+                    console.print("[red]│ You can still view the content in the vault.        │[/red]")
+                    console.print("[red]╰─────────────────────────────────────────────────────╯[/red]")
+                    console.print("")
+                    console.print("[dim]Session content is preserved in the database.[/dim]")
+                    console.print("[dim]Use 'claude-vault show' or browse preview to view it.[/dim]")
+                    continue
 
                 # Change to project directory if found
                 if project_dir and Path(project_dir).exists():

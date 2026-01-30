@@ -136,36 +136,7 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
         except:
             continue
 
-    # Fallback: try JSONL file
-    if transcript_path:
-        path = Path(transcript_path)
-        if path.exists():
-            try:
-                with open(path, 'r') as f:
-                    for line in f:
-                        try:
-                            entry = json.loads(line)
-                            if entry.get('type') in ('human', 'user'):
-                                message = entry.get('message', {})
-                                if isinstance(message, dict):
-                                    content = message.get('content', [])
-                                    if isinstance(content, list):
-                                        for item in content:
-                                            if isinstance(item, dict) and item.get('type') == 'text':
-                                                text = item.get('text', '').strip()
-                                                # Skip system-injected context
-                                                if _is_system_context(text):
-                                                    continue
-                                                text = text.replace('\n', ' ')[:80]
-                                                if len(text) > 77:
-                                                    text = text[:77] + "..."
-                                                return text
-                        except json.JSONDecodeError:
-                            continue
-            except Exception:
-                pass
-
-    # Last fallback: events table
+    # Fallback: events table (from hooks)
     events = get_session_events(session_id, limit=5)
     for event in events:
         if event.get('event_type') == 'UserPromptSubmit' and event.get('prompt'):
@@ -271,13 +242,7 @@ def get_session_preview(session_id: str, transcript_path: Optional[str] = None, 
         if lines:
             return '\n'.join(lines)
 
-    # Fallback: parse JSONL file directly
-    if transcript_path:
-        path = Path(transcript_path)
-        if path.exists():
-            return _parse_jsonl_for_preview(path, max_messages)
-
-    # Last fallback: database events
+    # Fallback: database events (from hooks)
     events = get_session_events(session_id, limit=max_messages)
     if events:
         for event in events:
@@ -292,63 +257,19 @@ def get_session_preview(session_id: str, transcript_path: Optional[str] = None, 
     return '\n'.join(lines) if lines else "[dim]No conversation content in this session.\n\nThis session may only contain metadata (file snapshots, etc.)\nor the transcript was not synced yet.\n\nTry: claude-vault sync --all[/dim]"
 
 
-def _parse_jsonl_for_preview(path: Path, max_messages: int) -> str:
-    """Parse JSONL file for preview."""
-    lines = []
-    message_count = 0
+def session_file_exists(session_id: str, transcript_path: Optional[str] = None) -> bool:
+    """Check if the session's JSONL file still exists in Claude's projects directory."""
+    # Check transcript_path if provided
+    if transcript_path:
+        return Path(transcript_path).exists()
 
-    try:
-        with open(path, 'r') as f:
-            for line in f:
-                if message_count >= max_messages:
-                    break
-                try:
-                    entry = json.loads(line)
-                    entry_type = entry.get('type')
+    # Search in Claude's projects directory
+    claude_projects = Path.home() / ".claude" / "projects"
+    if claude_projects.exists():
+        for jsonl_file in claude_projects.rglob(f"{session_id}.jsonl"):
+            return True
 
-                    if entry_type in ('human', 'user'):
-                        message = entry.get('message', {})
-                        content = message.get('content', '')
-                        if isinstance(content, list):
-                            content = ' '.join(
-                                item.get('text', '') for item in content
-                                if isinstance(item, dict) and item.get('type') == 'text'
-                            )
-                        if content:
-                            lines.append("")
-                            lines.append("[bold cyan]━━━ 👤 User ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
-                            lines.append(content[:500] + ("..." if len(content) > 500 else ""))
-                            message_count += 1
-
-                    elif entry_type == 'assistant':
-                        message = entry.get('message', {})
-                        content_blocks = message.get('content', [])
-                        text_parts = []
-                        tool_uses = []
-
-                        for block in content_blocks:
-                            if isinstance(block, dict):
-                                if block.get('type') == 'text':
-                                    text_parts.append(block.get('text', ''))
-                                elif block.get('type') == 'tool_use':
-                                    tool_uses.append(block.get('name', 'Unknown'))
-
-                        if text_parts or tool_uses:
-                            lines.append("")
-                            lines.append("[bold green]━━━ 🤖 Assistant ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold green]")
-                            if text_parts:
-                                text = ' '.join(text_parts)[:500]
-                                lines.append(text + ("..." if len(' '.join(text_parts)) > 500 else ""))
-                            for tool in tool_uses:
-                                lines.append(f"[bold yellow]⚡ {tool}[/bold yellow]")
-                            message_count += 1
-
-                except json.JSONDecodeError:
-                    continue
-    except Exception:
-        pass
-
-    return '\n'.join(lines) if lines else "[dim]Could not parse transcript[/dim]"
+    return False
 
 
 def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
@@ -635,6 +556,14 @@ class PreviewScreen(ModalScreen):
 
     def action_open_claude(self) -> None:
         """Open session in Claude Code."""
+        session_id = self.session.get('session_id', '')
+        transcript_path = self.session.get('transcript_path')
+
+        # Check if the session file still exists
+        if not session_file_exists(session_id, transcript_path):
+            self._show_status("[red]✗ Cannot open: Claude has deleted this session file.[/red]")
+            return
+
         # Exit and tell CLI to run claude --resume
         self.app.exit({"action": "resume_claude", "session": self.session})
 
