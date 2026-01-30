@@ -250,16 +250,19 @@ def list_sessions(
     project_filter: Optional[str] = None,
     db_path: Optional[Path] = None
 ) -> List[Dict[str, Any]]:
-    """List all sessions with event counts."""
+    """List all sessions with message counts from transcript_entries."""
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
+    # Use transcript_entries for last_activity (more reliable after sync)
+    # Fall back to events or started_at if no transcript data
     sql = """
         SELECT
             s.*,
-            COUNT(e.id) as event_count,
-            MAX(e.timestamp) as last_activity
+            COUNT(t.id) as message_count,
+            COALESCE(MAX(t.timestamp), MAX(e.timestamp), s.started_at) as last_activity
         FROM sessions s
+        LEFT JOIN transcript_entries t ON s.session_id = t.session_id
         LEFT JOIN events e ON s.session_id = e.session_id
     """
     params = []
@@ -270,7 +273,7 @@ def list_sessions(
 
     sql += """
         GROUP BY s.session_id
-        ORDER BY last_activity DESC
+        ORDER BY last_activity DESC NULLS LAST
         LIMIT ?
     """
     params.append(limit)

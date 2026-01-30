@@ -42,6 +42,9 @@ from claude_vault.db import (
 def relative_time(dt: datetime) -> str:
     """Convert datetime to human-readable relative time."""
     now = datetime.now()
+    # Handle timezone-aware datetimes by making dt naive
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
     diff = now - dt
     seconds = diff.total_seconds()
 
@@ -67,13 +70,73 @@ def relative_time(dt: datetime) -> str:
         return f"{n} month{'s' if n != 1 else ''} ago"
 
 
+def _is_system_context(text: str) -> bool:
+    """Check if text is system-injected context rather than a real user prompt."""
+    if not text:
+        return True
+    text_lower = text.strip().lower()
+    # Patterns that indicate system context, not a real user message
+    system_patterns = [
+        '## your environment',
+        '<system-reminder>',
+        'sessionstart:',
+        'working directory:',
+        '**working directory:**',
+        'this session is being continued',
+        'summary:',  # Session continuation summaries
+        'if you need specific details',
+        'please continue the conversation',
+    ]
+    for pattern in system_patterns:
+        if text_lower.startswith(pattern):
+            return True
+    return False
+
+
 def get_session_title(session_id: str, transcript_path: Optional[str] = None) -> str:
-    """Get the first user prompt as session title."""
+    """Get the first real user prompt as session title (skipping system context)."""
+    from claude_vault.db import get_transcript_entries
+
     # First check for custom name
     custom_name = get_session_custom_name(session_id)
     if custom_name:
         return custom_name
 
+    # Try transcript_entries from database (most reliable after sync)
+    entries = get_transcript_entries(session_id)
+    for entry in entries:
+        raw_json = entry.get('raw_json', '')
+        if not raw_json:
+            continue
+        try:
+            data = json.loads(raw_json)
+            if data.get('type') in ('user', 'human'):
+                message = data.get('message', {})
+                content = message.get('content', '')
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            text = item.get('text', '').strip()
+                            # Skip system-injected context
+                            if _is_system_context(text):
+                                continue
+                            text = text.replace('\n', ' ')[:80]
+                            if len(text) > 77:
+                                text = text[:77] + "..."
+                            return text
+                elif isinstance(content, str) and content:
+                    text = content.strip()
+                    # Skip system-injected context
+                    if _is_system_context(text):
+                        continue
+                    text = text.replace('\n', ' ')[:80]
+                    if len(text) > 77:
+                        text = text[:77] + "..."
+                    return text
+        except:
+            continue
+
+    # Fallback: try JSONL file
     if transcript_path:
         path = Path(transcript_path)
         if path.exists():
@@ -82,15 +145,18 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
                     for line in f:
                         try:
                             entry = json.loads(line)
-                            if entry.get('type') == 'human':
+                            if entry.get('type') in ('human', 'user'):
                                 message = entry.get('message', {})
                                 if isinstance(message, dict):
                                     content = message.get('content', [])
                                     if isinstance(content, list):
                                         for item in content:
                                             if isinstance(item, dict) and item.get('type') == 'text':
-                                                text = item.get('text', '')
-                                                text = text.strip().replace('\n', ' ')[:80]
+                                                text = item.get('text', '').strip()
+                                                # Skip system-injected context
+                                                if _is_system_context(text):
+                                                    continue
+                                                text = text.replace('\n', ' ')[:80]
                                                 if len(text) > 77:
                                                     text = text[:77] + "..."
                                                 return text
@@ -99,7 +165,7 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
             except Exception:
                 pass
 
-    # Fallback: get from database
+    # Last fallback: events table
     events = get_session_events(session_id, limit=5)
     for event in events:
         if event.get('event_type') == 'UserPromptSubmit' and event.get('prompt'):
@@ -108,7 +174,7 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
                 text = text[:77] + "..."
             return text
 
-    return "No title available"
+    return f"Session {session_id[:8]}"
 
 
 def get_session_preview(session_id: str, transcript_path: Optional[str] = None, max_messages: int = 20) -> str:
@@ -286,16 +352,25 @@ def _parse_jsonl_for_preview(path: Path, max_messages: int) -> str:
 
 
 def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
-    """Get sessions with enriched data."""
+    """Get sessions with enriched data from database."""
     sessions = list_sessions(limit=limit)
     enriched = []
+
+    conn = get_connection()
+    cursor = conn.cursor()
 
     for session in sessions:
         session_id = session['session_id']
 
-        # Get transcript path
-        conn = get_connection()
-        cursor = conn.cursor()
+        # Get message count from transcript_entries (most reliable)
+        cursor.execute(
+            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ?",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        message_count = row[0] if row else 0
+
+        # Get transcript path from events if available
         cursor.execute(
             "SELECT transcript_path FROM events WHERE session_id = ? AND transcript_path IS NOT NULL LIMIT 1",
             (session_id,)
@@ -306,25 +381,15 @@ def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
         # Parse last activity time
         last_activity = session.get('last_activity', '')
         try:
-            if 'T' in str(last_activity):
-                dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
+            if last_activity:
+                if 'T' in str(last_activity):
+                    dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
+                else:
+                    dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
             else:
-                dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
+                dt = datetime.now()
         except:
             dt = datetime.now()
-
-        # Get message count
-        message_count = 0
-        if transcript_path:
-            path = Path(transcript_path)
-            if path.exists():
-                try:
-                    with open(path, 'r') as f:
-                        message_count = sum(1 for line in f if line.strip())
-                except:
-                    pass
-        if message_count == 0:
-            message_count = session.get('event_count', 0)
 
         # Extract project name
         project_name = session.get('project_name') or session.get('project')
@@ -350,6 +415,7 @@ def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
             'transcript_path': transcript_path,
         })
 
+    conn.close()
     enriched.sort(key=lambda x: x['last_activity'], reverse=True)
     return enriched
 
