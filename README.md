@@ -83,6 +83,81 @@ claude-vault
 | ❌ No statistics | ✅ **Usage analytics** |
 | ❌ Closed format | ✅ **Open SQLite database** |
 
+## Complete Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           CLAUDE SESSION VAULT                              │
+│                              Complete Workflow                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │   INSTALL    │────▶│     SYNC     │────▶│    CHECK     │────▶│  UNINSTALL   │
+  │              │     │              │     │              │     │              │
+  │ pipx install │     │ sync --all   │     │ check --fix  │     │  uninstall   │
+  │ vault-install│     │              │     │              │     │              │
+  └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+         │                    │                    │                    │
+         ▼                    ▼                    ▼                    ▼
+   Install hooks        Import history      Detect & fix          Remove hooks
+   Create database      Enable search       discrepancies         Delete database
+```
+
+### Step 1: Install
+
+```bash
+# Install the package
+pipx install git+https://github.com/fatahbenguenna/claude-session-vault.git
+
+# Set up hooks in Claude Code (required)
+claude-vault-install
+```
+
+This installs hooks that automatically capture new sessions in real-time.
+
+### Step 2: Sync (Initial Import)
+
+```bash
+# Import all existing Claude Code sessions into the vault
+claude-vault sync --all
+
+# Verify the import
+claude-vault stats
+```
+
+This one-time sync imports your existing conversation history (can take a few minutes for large histories).
+
+### Step 3: Check (Maintenance)
+
+```bash
+# Detect discrepancies between Claude's files and vault database
+claude-vault check
+
+# View detailed information about discrepancies
+claude-vault check -v
+
+# Automatically fix missing sessions
+claude-vault check --fix
+```
+
+Run periodically to ensure the vault stays in sync. Detects:
+- **Missing**: Sessions in Claude's files but not in vault (sync issues)
+- **Orphaned**: Sessions in vault but Claude deleted the file (normal)
+- **Out of sync**: Different entry counts (active sessions)
+
+### Step 4: Uninstall (Optional)
+
+```bash
+# Complete removal (hooks + database)
+claude-vault uninstall
+
+# Keep database for later reinstall
+claude-vault uninstall --keep-db
+
+# Remove the package
+pipx uninstall claude-session-vault
+```
+
 ## Installation
 
 ### Recommended: pipx
