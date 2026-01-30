@@ -974,6 +974,191 @@ def version():
 
 
 @main.command()
+@click.option("--fix", is_flag=True, help="Automatically sync missing sessions")
+@click.option("--verbose", "-v", is_flag=True, help="Show detailed information")
+def check(fix: bool, verbose: bool):
+    """Check for discrepancies between Claude's files and the vault database.
+
+    \b
+    This command compares JSONL files in ~/.claude/projects with the vault
+    database to detect:
+        - Missing: Sessions in filesystem but not in database
+        - Orphaned: Sessions in database but file no longer exists
+        - Out of sync: Sessions with different entry counts
+
+    \b
+    Examples:
+        claude-vault check           # Show discrepancies
+        claude-vault check --fix     # Sync missing sessions automatically
+        claude-vault check -v        # Verbose output with details
+    """
+    from claude_vault.db import get_connection, init_db, sync_transcript_entries
+
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # 1. Get all JSONL files from filesystem
+    claude_projects = Path.home() / ".claude" / "projects"
+    if not claude_projects.exists():
+        console.print("[yellow]No Claude projects directory found at ~/.claude/projects[/yellow]")
+        conn.close()
+        return
+
+    console.print("[cyan]Scanning Claude projects directory...[/cyan]")
+    jsonl_files = list(claude_projects.rglob("*.jsonl"))
+    fs_sessions = {}  # session_id -> file_path
+
+    for jsonl_file in jsonl_files:
+        session_id = jsonl_file.stem
+        fs_sessions[session_id] = str(jsonl_file)
+
+    console.print(f"[dim]Found {len(fs_sessions)} JSONL files in filesystem[/dim]")
+
+    # 2. Get all sessions from database
+    cursor.execute("""
+        SELECT DISTINCT session_id FROM sessions
+        UNION
+        SELECT DISTINCT session_id FROM transcript_entries
+    """)
+    db_sessions = set(row[0] for row in cursor.fetchall())
+    console.print(f"[dim]Found {len(db_sessions)} sessions in database[/dim]")
+
+    # 3. Calculate discrepancies
+    fs_session_ids = set(fs_sessions.keys())
+
+    missing_in_db = fs_session_ids - db_sessions  # In filesystem, not in DB
+    orphaned_in_db = db_sessions - fs_session_ids  # In DB, not in filesystem
+
+    # 4. Check for entry count mismatches
+    out_of_sync = []
+    if verbose:
+        console.print("[dim]Checking entry counts...[/dim]")
+        for session_id in fs_session_ids & db_sessions:
+            # Count entries in file
+            file_path = fs_sessions[session_id]
+            try:
+                with open(file_path, 'r') as f:
+                    file_entries = sum(1 for line in f if line.strip())
+            except:
+                continue
+
+            # Count entries in DB
+            cursor.execute("""
+                SELECT COUNT(*) FROM transcript_entries WHERE session_id = ?
+            """, (session_id,))
+            db_entries = cursor.fetchone()[0]
+
+            if file_entries != db_entries and db_entries > 0:
+                out_of_sync.append({
+                    'session_id': session_id,
+                    'file_entries': file_entries,
+                    'db_entries': db_entries,
+                    'diff': file_entries - db_entries
+                })
+
+    conn.close()
+
+    # 5. Display results
+    console.print("")
+
+    if not missing_in_db and not orphaned_in_db and not out_of_sync:
+        console.print("[green]✅ No discrepancies found! Database is in sync with filesystem.[/green]")
+        return
+
+    # Missing sessions (in filesystem, not in DB)
+    if missing_in_db:
+        console.print(Panel(
+            f"[yellow]{len(missing_in_db)}[/yellow] sessions exist in filesystem but not in database",
+            title="[bold yellow]Missing in Database[/bold yellow]",
+            border_style="yellow"
+        ))
+        if verbose:
+            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+            table.add_column("Session ID", style="cyan")
+            table.add_column("File Path", style="dim")
+            for session_id in sorted(list(missing_in_db))[:20]:
+                table.add_row(session_id[:12] + "...", fs_sessions[session_id])
+            if len(missing_in_db) > 20:
+                table.add_row(f"... and {len(missing_in_db) - 20} more", "")
+            console.print(table)
+        console.print("")
+
+    # Orphaned sessions (in DB, not in filesystem)
+    if orphaned_in_db:
+        console.print(Panel(
+            f"[red]{len(orphaned_in_db)}[/red] sessions exist in database but file was deleted",
+            title="[bold red]Orphaned in Database[/bold red]",
+            border_style="red"
+        ))
+        if verbose:
+            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+            table.add_column("Session ID", style="cyan")
+            for session_id in sorted(list(orphaned_in_db))[:20]:
+                table.add_row(session_id[:12] + "...")
+            if len(orphaned_in_db) > 20:
+                table.add_row(f"... and {len(orphaned_in_db) - 20} more")
+            console.print(table)
+        console.print("")
+
+    # Out of sync sessions
+    if out_of_sync:
+        console.print(Panel(
+            f"[magenta]{len(out_of_sync)}[/magenta] sessions have different entry counts",
+            title="[bold magenta]Out of Sync[/bold magenta]",
+            border_style="magenta"
+        ))
+        if verbose:
+            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+            table.add_column("Session ID", style="cyan")
+            table.add_column("File", justify="right")
+            table.add_column("DB", justify="right")
+            table.add_column("Diff", justify="right")
+            for item in sorted(out_of_sync, key=lambda x: abs(x['diff']), reverse=True)[:20]:
+                diff_style = "green" if item['diff'] > 0 else "red"
+                table.add_row(
+                    item['session_id'][:12] + "...",
+                    str(item['file_entries']),
+                    str(item['db_entries']),
+                    f"[{diff_style}]{item['diff']:+d}[/{diff_style}]"
+                )
+            console.print(table)
+        console.print("")
+
+    # Summary
+    total_issues = len(missing_in_db) + len(orphaned_in_db) + len(out_of_sync)
+    console.print(f"[bold]Summary:[/bold] {total_issues} total discrepancies found")
+
+    # Fix option
+    if fix and missing_in_db:
+        console.print("")
+        console.print("[cyan]Syncing missing sessions...[/cyan]")
+
+        from claude_vault.db import sync_transcript_entries, rebuild_sessions_from_transcripts
+
+        synced_count = 0
+        with console.status("[bold green]Syncing...") as status:
+            for session_id in missing_in_db:
+                file_path = fs_sessions[session_id]
+                try:
+                    entries = sync_transcript_entries(session_id, file_path)
+                    if entries > 0:
+                        synced_count += 1
+                        status.update(f"[bold green]Synced {synced_count} sessions...")
+                except Exception as e:
+                    if verbose:
+                        console.print(f"[red]Error syncing {session_id[:8]}: {e}[/red]")
+
+        rebuild_sessions_from_transcripts()
+        console.print(f"[green]✅ Synced {synced_count} missing sessions[/green]")
+
+    elif missing_in_db and not fix:
+        console.print("")
+        console.print("[dim]Tip: Run [cyan]claude-vault check --fix[/cyan] to sync missing sessions[/dim]")
+        console.print("[dim]Or run [cyan]claude-vault sync --all[/cyan] for a full sync[/dim]")
+
+
+@main.command()
 @click.option("--keep-db", is_flag=True, help="Keep the database file")
 @click.confirmation_option(prompt="This will remove hooks, database, and uninstall. Continue?")
 def uninstall(keep_db: bool):

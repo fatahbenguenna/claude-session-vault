@@ -189,6 +189,19 @@ Top Projects: fps-api (31), luxCaRent (2), claude-session-vault (1)
 Most Used Tools: Bash (417), Read (327), Edit (67)
 ```
 
+### Check Integrity
+
+```bash
+# Detect discrepancies between filesystem and database
+claude-vault check
+
+# Show detailed information
+claude-vault check -v
+
+# Automatically sync missing sessions
+claude-vault check --fix
+```
+
 ### Other
 
 ```bash
