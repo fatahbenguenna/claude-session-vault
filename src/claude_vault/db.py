@@ -454,6 +454,24 @@ def sync_transcript_entries(
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
+    # Ensure session exists in sessions table
+    # Extract project info from path: ~/.claude/projects/-Users-fatah-project-name/session.jsonl
+    project_path = str(jsonl_file.parent)
+    project_name = jsonl_file.parent.name
+    # Convert -Users-fatah-project-name to just project-name
+    if project_name.startswith('-'):
+        parts = project_name.split('-')
+        # Find the last meaningful part (skip Users, username, etc.)
+        if len(parts) > 3:
+            project_name = '-'.join(parts[3:])  # Skip -Users-username-
+        else:
+            project_name = parts[-1] if parts else project_name
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO sessions (session_id, project_path, project_name, started_at)
+        VALUES (?, ?, ?, datetime('now'))
+    """, (session_id, project_path, project_name))
+
     try:
         with open(jsonl_file, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f):
@@ -546,6 +564,67 @@ def get_transcript_entries(
     conn.close()
 
     return results
+
+
+def rebuild_sessions_from_transcripts(db_path: Optional[Path] = None) -> int:
+    """Rebuild sessions table from transcript_entries for sessions that don't exist.
+
+    Returns the number of sessions created.
+    """
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    # Find all unique session_ids in transcript_entries that don't have a session record
+    cursor.execute("""
+        SELECT DISTINCT t.session_id
+        FROM transcript_entries t
+        LEFT JOIN sessions s ON t.session_id = s.session_id
+        WHERE s.session_id IS NULL
+    """)
+    orphan_sessions = [row[0] for row in cursor.fetchall()]
+
+    created = 0
+    for session_id in orphan_sessions:
+        # Get first and last timestamps
+        cursor.execute("""
+            SELECT MIN(timestamp), MAX(timestamp)
+            FROM transcript_entries
+            WHERE session_id = ?
+        """, (session_id,))
+        row = cursor.fetchone()
+        started_at = row[0] if row else None
+        ended_at = row[1] if row else None
+
+        # Try to extract project name from raw_json (cwd field)
+        project_name = 'Unknown'
+        project_path = None
+        cursor.execute("""
+            SELECT raw_json FROM transcript_entries
+            WHERE session_id = ? AND raw_json IS NOT NULL
+            LIMIT 1
+        """, (session_id,))
+        raw_row = cursor.fetchone()
+        if raw_row and raw_row[0]:
+            try:
+                data = json.loads(raw_row[0])
+                cwd = data.get('cwd', '')
+                if cwd:
+                    project_path = cwd
+                    project_name = Path(cwd).name
+            except:
+                pass
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO sessions (session_id, project_path, project_name, started_at, ended_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (session_id, project_path, project_name, started_at, ended_at))
+
+        if cursor.rowcount > 0:
+            created += 1
+
+    conn.commit()
+    conn.close()
+    return created
 
 
 def search_transcripts(

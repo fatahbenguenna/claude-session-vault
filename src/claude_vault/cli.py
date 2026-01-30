@@ -899,6 +899,15 @@ def sync(session: Optional[str], sync_all: bool, force: bool):
     else:
         console.print("[dim]All transcripts already synced (no new content)[/dim]")
 
+    # Rebuild sessions table from transcript entries
+    from claude_vault.db import rebuild_sessions_from_transcripts
+    console.print("[cyan]Rebuilding sessions index...[/cyan]")
+    created = rebuild_sessions_from_transcripts()
+    if created > 0:
+        console.print(f"[green]✅ Created {created} session records[/green]")
+    else:
+        console.print("[dim]Sessions index up to date[/dim]")
+
 
 @main.command()
 def update():
