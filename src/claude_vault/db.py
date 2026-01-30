@@ -36,11 +36,18 @@ def init_db(db_path: Optional[Path] = None) -> None:
             session_id TEXT UNIQUE NOT NULL,
             project_path TEXT,
             project_name TEXT,
+            custom_name TEXT,
             started_at TIMESTAMP,
             ended_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Add custom_name column if it doesn't exist (migration for existing DBs)
+    try:
+        cursor.execute("ALTER TABLE sessions ADD COLUMN custom_name TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     # Events table for all hook events
     cursor.execute("""
@@ -300,3 +307,46 @@ def get_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
 
     conn.close()
     return stats
+
+
+def rename_session(session_id: str, custom_name: str, db_path: Optional[Path] = None) -> bool:
+    """Rename a session with a custom name."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    # Handle partial session IDs
+    cursor.execute(
+        "SELECT session_id FROM sessions WHERE session_id LIKE ?",
+        (f"{session_id}%",)
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    full_session_id = row[0]
+
+    cursor.execute(
+        "UPDATE sessions SET custom_name = ? WHERE session_id = ?",
+        (custom_name, full_session_id)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_session_custom_name(session_id: str, db_path: Optional[Path] = None) -> Optional[str]:
+    """Get the custom name for a session if set."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT custom_name FROM sessions WHERE session_id LIKE ?",
+        (f"{session_id}%",)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if row and row[0]:
+        return row[0]
+    return None
