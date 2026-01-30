@@ -51,3 +51,6 @@ Thumbs.db
 # Distribution
 *.tar.gz
 *.whl
+
+# Claude Code local config
+.claude/

@@ -289,7 +289,7 @@ def get_session_preview(session_id: str, transcript_path: Optional[str] = None, 
             elif event.get('tool_name'):
                 lines.append(f"[bold yellow]⚡ {event['tool_name']}[/bold yellow]")
 
-    return '\n'.join(lines) if lines else "[dim]No preview available - try running 'claude-vault sync'[/dim]"
+    return '\n'.join(lines) if lines else "[dim]No conversation content in this session.\n\nThis session may only contain metadata (file snapshots, etc.)\nor the transcript was not synced yet.\n\nTry: claude-vault sync --all[/dim]"
 
 
 def _parse_jsonl_for_preview(path: Path, max_messages: int) -> str:
@@ -362,13 +362,17 @@ def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
     for session in sessions:
         session_id = session['session_id']
 
-        # Get message count from transcript_entries (most reliable)
+        # Get message count from transcript_entries (only real messages, not metadata)
         cursor.execute(
-            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ?",
+            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ? AND entry_type IN ('user', 'human', 'assistant')",
             (session_id,)
         )
         row = cursor.fetchone()
         message_count = row[0] if row else 0
+
+        # Skip sessions with no real messages (only metadata)
+        if message_count == 0:
+            continue
 
         # Get transcript path from events if available
         cursor.execute(
@@ -378,12 +382,15 @@ def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
         row = cursor.fetchone()
         transcript_path = row[0] if row else None
 
-        # Parse last activity time
+        # Parse last activity time (always use naive datetime for comparison)
         last_activity = session.get('last_activity', '')
         try:
             if last_activity:
                 if 'T' in str(last_activity):
                     dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
+                    # Convert to naive datetime for consistent comparison
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
                 else:
                     dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
             else:
@@ -478,6 +485,15 @@ class RenameScreen(ModalScreen):
 class PreviewScreen(ModalScreen):
     """Modal screen for previewing a session with conversation format."""
 
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=False),
+        Binding("q", "close", "Close", show=False),
+        Binding("e", "export_file", "Export", show=False),
+        Binding("c", "copy_clipboard", "Copy", show=False),
+        Binding("o", "open_claude", "Open", show=False),
+        Binding("enter", "open_claude", "Open in Claude", show=False),
+    ]
+
     CSS = """
     PreviewScreen {
         align: center middle;
@@ -510,10 +526,16 @@ class PreviewScreen(ModalScreen):
     }
 
     #preview-footer {
-        height: 1;
+        height: auto;
         text-align: center;
         color: #888;
         margin-top: 1;
+    }
+
+    #preview-status {
+        height: 1;
+        text-align: center;
+        color: #58a6ff;
     }
     """
 
@@ -538,13 +560,88 @@ class PreviewScreen(ModalScreen):
                 Static(preview, id="preview-content", markup=True),
                 id="preview-scroll"
             ),
-            Static("↑↓ Scroll · Esc/Enter Close", id="preview-footer"),
+            Static("", id="preview-status"),
+            Static("↑↓:Scroll · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close", id="preview-footer"),
             id="preview-dialog"
         )
 
-    def on_key(self, event) -> None:
-        if event.key in ("escape", "enter", "q"):
-            self.dismiss()
+    def action_close(self) -> None:
+        """Close the preview and return to session list."""
+        self.dismiss()
+
+    def action_export_file(self) -> None:
+        """Export session to Markdown file."""
+        self.dismiss({"action": "export_md", "session": self.session})
+
+    def action_copy_clipboard(self) -> None:
+        """Copy session content to clipboard."""
+        import subprocess
+
+        # Get the preview content (plain text without Rich markup)
+        session_id = self.session['session_id']
+        transcript_path = self.session.get('transcript_path')
+
+        # Build plain text export
+        from claude_vault.db import get_transcript_entries
+        lines = []
+        entries = get_transcript_entries(session_id)
+
+        for entry in entries:
+            raw_json = entry.get('raw_json', '')
+            if not raw_json:
+                continue
+            try:
+                import json
+                data = json.loads(raw_json)
+                entry_type = data.get('type', '')
+
+                if entry_type in ('user', 'human'):
+                    message = data.get('message', {})
+                    content = message.get('content', '')
+                    if isinstance(content, list):
+                        content = ' '.join(
+                            item.get('text', '') for item in content
+                            if isinstance(item, dict) and item.get('type') == 'text'
+                        )
+                    if content:
+                        lines.append(f"## User\n{content}\n")
+
+                elif entry_type == 'assistant':
+                    message = data.get('message', {})
+                    content_blocks = message.get('content', [])
+                    text_parts = []
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            text_parts.append(block.get('text', ''))
+                    if text_parts:
+                        lines.append(f"## Assistant\n{chr(10).join(text_parts)}\n")
+            except:
+                continue
+
+        text = '\n'.join(lines) if lines else "No content to copy"
+
+        # Copy to clipboard using pbcopy (macOS) or xclip (Linux)
+        try:
+            process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+            process.communicate(text.encode('utf-8'))
+            self._show_status("[green]✓ Copied to clipboard[/green]")
+        except FileNotFoundError:
+            try:
+                process = subprocess.Popen(['xclip', '-selection', 'clipboard'], stdin=subprocess.PIPE)
+                process.communicate(text.encode('utf-8'))
+                self._show_status("[green]✓ Copied to clipboard[/green]")
+            except FileNotFoundError:
+                self._show_status("[red]✗ Clipboard not available (install pbcopy or xclip)[/red]")
+
+    def action_open_claude(self) -> None:
+        """Open session in Claude Code."""
+        # Exit and tell CLI to run claude --resume
+        self.app.exit({"action": "resume_claude", "session": self.session})
+
+    def _show_status(self, message: str) -> None:
+        """Show a status message."""
+        status = self.query_one("#preview-status", Static)
+        status.update(message)
 
 
 class SessionBrowser(App):
@@ -604,11 +701,12 @@ class SessionBrowser(App):
         Binding("ctrl+j", "export_json", "JSON", show=True),
         Binding("ctrl+v", "preview", "Preview", show=True),
         Binding("ctrl+r", "rename", "Rename", show=True),
-        Binding("ctrl+a", "toggle_all", "Toggle All", show=True),
         Binding("ctrl+f", "focus_search", "Search", show=False),
+        Binding("up", "cursor_up", "Up", show=False, priority=True),
+        Binding("down", "cursor_down", "Down", show=False, priority=True),
+        Binding("left", "collapse_group", "Collapse", show=False, priority=True),
+        Binding("right", "expand_group", "Expand", show=False, priority=True),
     ]
-
-    show_all = reactive(True)
 
     def __init__(self, project_filter: Optional[str] = None):
         super().__init__()
@@ -620,7 +718,7 @@ class SessionBrowser(App):
         yield Static("Browse Sessions", id="header")
         yield Container(Input(placeholder="🔍 Type to search...", id="search-input"), id="search-box")
         yield Tree("Sessions", id="session-tree")
-        yield Static("↑↓:nav · Enter:select · ^V:preview · ^R:rename · ^E:export · ^A:toggle · Esc:quit", id="footer")
+        yield Static("↑↓:nav · ←→:fold · Enter:select · ^V:preview · ^R:rename · ^E:export · Esc:quit", id="footer")
 
     def on_mount(self) -> None:
         """Initialize."""
@@ -629,6 +727,18 @@ class SessionBrowser(App):
         tree = self.query_one("#session-tree", Tree)
         tree.root.expand()
         tree.focus()
+        # Position cursor on first session node (skip metadata)
+        self.call_later(self._select_first_session)
+
+    def _select_first_session(self) -> None:
+        """Select the first navigable node (group or session)."""
+        tree = self.query_one("#session-tree", Tree)
+        tree.action_cursor_down()
+        # Skip metadata nodes
+        attempts = 0
+        while tree.cursor_node and not self._is_navigable_node(tree.cursor_node) and attempts < 50:
+            tree.action_cursor_down()
+            attempts += 1
 
     def load_sessions(self, search_query: str = "") -> None:
         """Load and display sessions, searching in content when query >= 3 chars."""
@@ -654,11 +764,14 @@ class SessionBrowser(App):
 
                     for cr in content_results:
                         if cr['session_id'] not in existing_ids:
-                            # Parse last_activity to datetime (same as get_enriched_sessions)
+                            # Parse last_activity to datetime (always naive for comparison)
                             last_activity = cr['last_activity']
                             try:
                                 if last_activity and 'T' in str(last_activity):
                                     dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
+                                    # Convert to naive datetime for consistent comparison
+                                    if dt.tzinfo is not None:
+                                        dt = dt.replace(tzinfo=None)
                                 elif last_activity:
                                     dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
                                 else:
@@ -708,42 +821,29 @@ class SessionBrowser(App):
 
         for project in sorted_projects:
             project_sessions = sorted(groups[project], key=lambda x: x['last_activity'], reverse=True)
-            first = project_sessions[0]
-            others = len(project_sessions) - 1
 
-            # Project node label
-            label = Text()
-            label.append("▼ " if self.show_all else "▸ ", style="cyan")
-            label.append(first['title'], style="bold white")
-            if others > 0:
-                label.append(f" (+{others} other session{'s' if others > 1 else ''})", style="dim")
+            # Project group node (collapsible)
+            group_label = Text()
+            group_label.append("📁 ", style="cyan")
+            group_label.append(project, style="cyan bold")
+            group_label.append(f" ({len(project_sessions)})", style="dim")
 
-            project_node = tree.root.add(label, data=first, expand=self.show_all)
-            self.session_nodes[first['session_id']] = project_node
+            # Group node has no session data - it's just for organization
+            project_group = tree.root.add(group_label, expand=True)
 
-            # Meta info line
-            meta = Text()
-            meta.append(f"{first['relative_time']}", style="dim")
-            meta.append(" · ", style="dim")
-            meta.append(f"{first['message_count']} messages", style="dim")
-            meta.append(" · ", style="dim")
-            meta.append(project, style="cyan dim")
-            project_node.add_leaf(meta)
+            # Add all sessions as children of the group
+            for session in project_sessions:
+                session_label = Text()
+                session_label.append("▸ ", style="cyan")
+                session_label.append(session['title'], style="white")
 
-            # Add other sessions
-            for session in project_sessions[1:]:
-                child_label = Text()
-                child_label.append("  ▸ ", style="cyan")
-                child_label.append(session['title'], style="white")
+                session_node = project_group.add(session_label, data=session, expand=True)
+                self.session_nodes[session['session_id']] = session_node
 
-                child_node = project_node.add(child_label, data=session)
-                self.session_nodes[session['session_id']] = child_node
-
-                child_meta = Text()
-                child_meta.append(f"    {session['relative_time']}", style="dim")
-                child_meta.append(" · ", style="dim")
-                child_meta.append(f"{session['message_count']} messages", style="dim")
-                child_node.add_leaf(child_meta)
+                # Meta info as leaf (will be skipped in navigation)
+                meta = Text()
+                meta.append(f"  {session['relative_time']} · {session['message_count']} msg", style="dim")
+                session_node.add_leaf(meta)  # No data = metadata node
 
         tree.root.expand()
 
@@ -759,11 +859,6 @@ class SessionBrowser(App):
     @on(Input.Changed, "#search-input")
     def on_search(self, event: Input.Changed) -> None:
         self.load_sessions(event.value)
-
-    @on(Tree.NodeSelected)
-    def on_node_selected(self, event: Tree.NodeSelected) -> None:
-        if event.node.data and isinstance(event.node.data, dict) and 'session_id' in event.node.data:
-            self.exit(event.node.data)
 
     def action_select(self) -> None:
         session = self.get_selected_session()
@@ -787,7 +882,12 @@ class SessionBrowser(App):
     def action_preview(self) -> None:
         session = self.get_selected_session()
         if session:
-            self.push_screen(PreviewScreen(session))
+            def on_preview_result(result) -> None:
+                if isinstance(result, dict) and result.get('action'):
+                    # Export action from preview - exit browser with this action
+                    self.exit(result)
+
+            self.push_screen(PreviewScreen(session), on_preview_result)
 
     def action_rename(self) -> None:
         session = self.get_selected_session()
@@ -802,20 +902,85 @@ class SessionBrowser(App):
 
             self.push_screen(RenameScreen(session), on_rename)
 
-    def action_toggle_all(self) -> None:
-        self.show_all = not self.show_all
-        tree = self.query_one("#session-tree", Tree)
-        for node in tree.root.children:
-            if self.show_all:
-                node.expand()
-            else:
-                node.collapse()
-
     def action_focus_search(self) -> None:
         self.query_one("#search-input", Input).focus()
 
     def action_quit(self) -> None:
         self.exit(None)
+
+    def _is_session_node(self, node) -> bool:
+        """Check if node is a session (has data with session_id)."""
+        return node and node.data and isinstance(node.data, dict) and 'session_id' in node.data
+
+    def _is_group_node(self, node) -> bool:
+        """Check if node is a project group (expandable, no session data)."""
+        return node and node.allow_expand and not self._is_session_node(node) and node.parent == self.query_one("#session-tree", Tree).root
+
+    def _find_parent_group(self, node):
+        """Find the parent project group of a node."""
+        tree = self.query_one("#session-tree", Tree)
+        current = node
+        while current and current.parent != tree.root:
+            current = current.parent
+        return current if current and current.parent == tree.root else None
+
+    def action_collapse_group(self) -> None:
+        """Collapse the project group (left arrow)."""
+        tree = self.query_one("#session-tree", Tree)
+        if not tree.cursor_node:
+            return
+
+        # Find the project group to collapse
+        if self._is_group_node(tree.cursor_node):
+            # Already on a group node - collapse it
+            tree.cursor_node.collapse()
+        else:
+            # Find parent group and collapse it
+            group = self._find_parent_group(tree.cursor_node)
+            if group:
+                group.collapse()
+                tree.select_node(group)
+
+    def action_expand_group(self) -> None:
+        """Expand the project group (right arrow)."""
+        tree = self.query_one("#session-tree", Tree)
+        if not tree.cursor_node:
+            return
+
+        # Find the project group to expand
+        if self._is_group_node(tree.cursor_node):
+            tree.cursor_node.expand()
+            # Move to first session in the group
+            self.action_cursor_down()
+        else:
+            # Find parent group and expand it
+            group = self._find_parent_group(tree.cursor_node)
+            if group:
+                group.expand()
+
+    def _is_navigable_node(self, node) -> bool:
+        """Check if node is navigable (session or project group, not metadata)."""
+        return self._is_session_node(node) or self._is_group_node(node)
+
+    def action_cursor_up(self) -> None:
+        """Move cursor up, skipping metadata nodes."""
+        tree = self.query_one("#session-tree", Tree)
+        tree.action_cursor_up()
+        # Skip metadata nodes (keep sessions and groups)
+        attempts = 0
+        while tree.cursor_node and not self._is_navigable_node(tree.cursor_node) and attempts < 50:
+            tree.action_cursor_up()
+            attempts += 1
+
+    def action_cursor_down(self) -> None:
+        """Move cursor down, skipping metadata nodes."""
+        tree = self.query_one("#session-tree", Tree)
+        tree.action_cursor_down()
+        # Skip metadata nodes (keep sessions and groups)
+        attempts = 0
+        while tree.cursor_node and not self._is_navigable_node(tree.cursor_node) and attempts < 50:
+            tree.action_cursor_down()
+            attempts += 1
 
     def on_key(self, event) -> None:
         search = self.query_one("#search-input", Input)

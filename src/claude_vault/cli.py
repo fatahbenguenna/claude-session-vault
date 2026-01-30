@@ -1079,6 +1079,67 @@ def browse(ctx, project: Optional[str]):
                 console.print(f"\n[cyan]Exporting to {default_name}...[/cyan]")
                 ctx.invoke(export, output_path=default_name, session=session['session_id'], fmt='json')
 
+            elif result.get('action') == 'resume_claude':
+                session = result['session']
+                session_id = session['session_id']
+
+                import os
+
+                def decode_project_path(encoded_name: str) -> str:
+                    """Decode Claude's encoded project path.
+
+                    Encoding: / -> -  and  _ -> - (with -- for /_)
+                    Simple decode: just replace - with / for paths without underscores.
+                    """
+                    if not encoded_name.startswith('-'):
+                        return encoded_name
+                    # Simple decode for common case (no underscores in path)
+                    return encoded_name.replace('-', '/')
+
+                # Strategy 1: Use transcript_path from session
+                transcript_path = session.get('transcript_path')
+                project_dir = None
+
+                if transcript_path:
+                    parent_name = Path(transcript_path).parent.name
+                    project_dir = decode_project_path(parent_name)
+
+                # Strategy 2: Find JSONL file in Claude's projects directory
+                if not project_dir or not Path(project_dir).exists():
+                    claude_projects = Path.home() / ".claude" / "projects"
+                    if claude_projects.exists():
+                        for jsonl_file in claude_projects.rglob(f"{session_id}.jsonl"):
+                            parent_name = jsonl_file.parent.name
+                            project_dir = decode_project_path(parent_name)
+                            break
+
+                # Strategy 3: Try events table
+                if not project_dir or not Path(project_dir).exists():
+                    from claude_vault.db import get_connection
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT transcript_path FROM events
+                        WHERE session_id = ? AND transcript_path IS NOT NULL
+                        LIMIT 1
+                    """, (session_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        parent_name = Path(row[0]).parent.name
+                        project_dir = decode_project_path(parent_name)
+                    conn.close()
+
+                # Change to project directory if found
+                if project_dir and Path(project_dir).exists():
+                    console.print(f"[dim]Project: {project_dir}[/dim]")
+                    os.chdir(project_dir)
+                else:
+                    console.print(f"[yellow]Warning: Could not determine project directory[/yellow]")
+
+                console.print(f"[cyan]Opening session in Claude Code...[/cyan]")
+                # Replace current process with claude --resume
+                os.execvp('claude', ['claude', '--resume', session_id])
+
             elif 'session_id' in result:
                 # User selected a session - show it
                 ctx.invoke(show, session_id=result['session_id'], limit=100, as_json=False, prompts_only=False, tools_only=False)
