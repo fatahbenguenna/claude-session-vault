@@ -772,29 +772,48 @@ def path():
 
 @main.command()
 @click.option("-s", "--session", default=None, help="Sync a specific session ID")
-@click.option("-a", "--all", "sync_all", is_flag=True, help="Sync all known sessions")
-def sync(session: Optional[str], sync_all: bool):
+@click.option("-a", "--all", "sync_all", is_flag=True, help="Scan all JSONL files in ~/.claude/projects")
+@click.option("-f", "--force", is_flag=True, help="Delete existing entries and re-sync from scratch")
+def sync(session: Optional[str], sync_all: bool, force: bool):
     """Sync transcript content from JSONL files to the vault database.
 
-    This makes your session data independent of Claude's JSONL files,
-    so exports work even if the original files are deleted.
+    \b
+    This enables full-text search in session content and makes exports
+    independent of Claude's original files.
 
     \b
     Examples:
-        claude-vault sync --session abc123    # Sync specific session
-        claude-vault sync --all               # Sync all known sessions
+        claude-vault sync              # Sync sessions tracked by hooks
+        claude-vault sync --all        # Scan ALL JSONL files (~15k files)
+        claude-vault sync --force      # Re-sync from scratch (deletes existing)
+        claude-vault sync -s abc123    # Sync specific session
     """
-    from claude_vault.db import get_connection
+    from claude_vault.db import get_connection, sync_transcript_entries, init_db
 
-    if not session and not sync_all:
-        console.print("[yellow]Specify --session <id> or --all[/yellow]")
-        return
-
+    init_db()
     conn = get_connection()
     cursor = conn.cursor()
 
+    # Handle --force: delete all existing transcript entries
+    if force:
+        cursor.execute("SELECT COUNT(*) FROM transcript_entries")
+        count = cursor.fetchone()[0]
+        if count > 0:
+            console.print(f"[yellow]Deleting {count} existing transcript entries...[/yellow]")
+            cursor.execute("DELETE FROM transcript_entries")
+            # Also rebuild FTS index
+            try:
+                cursor.execute("DELETE FROM transcript_fts")
+            except:
+                pass
+            conn.commit()
+            console.print("[green]✓ Cleared existing data[/green]")
+
+    synced_total = 0
+    sessions_synced = 0
+
     if session:
-        # Sync single session
+        # Sync single session - find its transcript path
         cursor.execute("""
             SELECT DISTINCT session_id, transcript_path
             FROM events
@@ -802,43 +821,83 @@ def sync(session: Optional[str], sync_all: bool):
             LIMIT 1
         """, (f"{session}%",))
         row = cursor.fetchone()
-        conn.close()
 
         if not row:
-            console.print(f"[red]Session '{session}' not found or has no transcript path[/red]")
+            # Try finding the JSONL file directly
+            claude_projects = Path.home() / ".claude" / "projects"
+            for jsonl_file in claude_projects.rglob(f"{session}*.jsonl"):
+                full_session_id = jsonl_file.stem
+                synced = sync_transcript_entries(full_session_id, str(jsonl_file))
+                console.print(f"[green]Synced {synced} entries for session {full_session_id[:8]}[/green]")
+                conn.close()
+                return
+
+            console.print(f"[red]Session '{session}' not found[/red]")
+            conn.close()
             return
 
         full_session_id, transcript_path = row[0], row[1]
         synced = sync_transcript_entries(full_session_id, transcript_path)
-        console.print(f"[green]Synced {synced} new entries for session {full_session_id[:8]}[/green]")
+        console.print(f"[green]Synced {synced} entries for session {full_session_id[:8]}[/green]")
+        conn.close()
+        return
 
+    if sync_all:
+        # Scan Claude's project directories for ALL JSONL files
+        claude_projects = Path.home() / ".claude" / "projects"
+        if not claude_projects.exists():
+            console.print("[yellow]No Claude projects directory found[/yellow]")
+            conn.close()
+            return
+
+        jsonl_files = list(claude_projects.rglob("*.jsonl"))
+        console.print(f"[cyan]Found {len(jsonl_files)} JSONL files to scan...[/cyan]")
+
+        with console.status("[bold green]Syncing transcripts...") as status:
+            for jsonl_file in jsonl_files:
+                session_id = jsonl_file.stem
+                try:
+                    new_entries = sync_transcript_entries(session_id, str(jsonl_file))
+                    if new_entries > 0:
+                        synced_total += new_entries
+                        sessions_synced += 1
+                        status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
+                except Exception as e:
+                    pass  # Skip errors silently
     else:
-        # Sync all sessions
+        # Sync only sessions tracked in the vault (from hooks)
         cursor.execute("""
             SELECT DISTINCT session_id, transcript_path
             FROM events
             WHERE transcript_path IS NOT NULL
         """)
         rows = cursor.fetchall()
-        conn.close()
 
         if not rows:
-            console.print("[yellow]No sessions with transcript paths found[/yellow]")
+            console.print("[yellow]No sessions tracked yet. Use --all to scan all JSONL files.[/yellow]")
+            conn.close()
             return
 
-        total_synced = 0
-        sessions_synced = 0
+        console.print(f"[cyan]Found {len(rows)} tracked sessions to sync...[/cyan]")
 
         with console.status("[bold green]Syncing sessions...") as status:
             for row in rows:
                 session_id, transcript_path = row[0], row[1]
                 status.update(f"[bold green]Syncing {session_id[:8]}...")
-                synced = sync_transcript_entries(session_id, transcript_path)
-                if synced > 0:
-                    total_synced += synced
-                    sessions_synced += 1
+                try:
+                    synced = sync_transcript_entries(session_id, transcript_path)
+                    if synced > 0:
+                        synced_total += synced
+                        sessions_synced += 1
+                except:
+                    pass
 
-        console.print(f"[green]✅ Synced {total_synced} entries across {sessions_synced} sessions[/green]")
+    conn.close()
+
+    if synced_total > 0:
+        console.print(f"[green]✅ Synced {synced_total} entries across {sessions_synced} sessions[/green]")
+    else:
+        console.print("[dim]All transcripts already synced (no new content)[/dim]")
 
 
 @main.command()
@@ -906,6 +965,57 @@ def version():
 
 
 @main.command()
+@click.option("--keep-db", is_flag=True, help="Keep the database file")
+@click.confirmation_option(prompt="This will remove hooks, database, and uninstall. Continue?")
+def uninstall(keep_db: bool):
+    """Completely uninstall claude-session-vault.
+
+    \b
+    This will:
+    1. Remove hooks from Claude Code settings
+    2. Delete the database (~800 MB)
+    3. Uninstall the package
+
+    \b
+    Example:
+        claude-vault uninstall           # Full uninstall
+        claude-vault uninstall --keep-db # Keep database for later
+    """
+    import subprocess
+    import shutil
+
+    # 1. Remove hooks
+    console.print("[cyan]Removing hooks from Claude Code...[/cyan]")
+    try:
+        from claude_vault.installer import uninstall_hooks
+        uninstall_hooks()
+        console.print("[green]✓ Hooks removed[/green]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: Could not remove hooks: {e}[/yellow]")
+
+    # 2. Delete database
+    if not keep_db:
+        db_path = Path.home() / ".claude" / "vault.db"
+        if db_path.exists():
+            size_mb = db_path.stat().st_size / (1024 * 1024)
+            db_path.unlink()
+            console.print(f"[green]✓ Database deleted ({size_mb:.1f} MB freed)[/green]")
+        else:
+            console.print("[dim]Database not found[/dim]")
+    else:
+        console.print("[dim]Database kept (--keep-db)[/dim]")
+
+    # 3. Uninstall package
+    console.print("[cyan]Uninstalling package...[/cyan]")
+    console.print("")
+    console.print("[bold]Run this command to complete uninstallation:[/bold]")
+    console.print("[yellow]pipx uninstall claude-session-vault[/yellow]")
+    console.print("")
+    console.print("[dim]Or if installed with pip:[/dim]")
+    console.print("[yellow]pip uninstall claude-session-vault[/yellow]")
+
+
+@main.command()
 @click.option("-p", "--project", default=None, help="Filter by project name")
 @click.pass_context
 def browse(ctx, project: Optional[str]):
@@ -970,84 +1080,6 @@ def browse(ctx, project: Optional[str]):
         console.print(f"[red]Error: {e}[/red]")
         import traceback
         traceback.print_exc()
-
-
-@main.command()
-@click.option("--all", "sync_all", is_flag=True, help="Sync all sessions, not just those in the vault")
-def sync(sync_all: bool):
-    """Sync transcript content from JSONL files into the vault database.
-
-    \b
-    This enables full-text search in session content. By default, only syncs
-    sessions already tracked in the vault. Use --all to scan Claude's project
-    directories for any JSONL files.
-
-    \b
-    Examples:
-        claude-vault sync        # Sync tracked sessions
-        claude-vault sync --all  # Scan and sync all JSONL files
-    """
-    from claude_vault.db import (
-        get_connection,
-        sync_transcript_entries,
-        init_db,
-    )
-
-    init_db()
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    synced_total = 0
-    sessions_synced = 0
-
-    if sync_all:
-        # Scan Claude's project directories
-        claude_projects = Path.home() / ".claude" / "projects"
-        if claude_projects.exists():
-            jsonl_files = list(claude_projects.rglob("*.jsonl"))
-            console.print(f"[cyan]Found {len(jsonl_files)} JSONL files to scan...[/cyan]")
-
-            with console.status("[bold green]Syncing transcripts...") as status:
-                for jsonl_file in jsonl_files:
-                    session_id = jsonl_file.stem
-                    try:
-                        new_entries = sync_transcript_entries(session_id, str(jsonl_file))
-                        if new_entries > 0:
-                            synced_total += new_entries
-                            sessions_synced += 1
-                            status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
-                    except Exception as e:
-                        console.print(f"[yellow]Warning: {jsonl_file.name}: {e}[/yellow]")
-        else:
-            console.print("[yellow]No Claude projects directory found[/yellow]")
-    else:
-        # Only sync sessions already in the vault
-        cursor.execute("""
-            SELECT DISTINCT session_id, transcript_path
-            FROM events
-            WHERE transcript_path IS NOT NULL
-        """)
-        sessions = cursor.fetchall()
-        console.print(f"[cyan]Found {len(sessions)} tracked sessions to sync...[/cyan]")
-
-        with console.status("[bold green]Syncing transcripts...") as status:
-            for session_id, transcript_path in sessions:
-                try:
-                    new_entries = sync_transcript_entries(session_id, transcript_path)
-                    if new_entries > 0:
-                        synced_total += new_entries
-                        sessions_synced += 1
-                        status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
-                except Exception as e:
-                    pass  # Skip errors silently for tracked sessions
-
-    conn.close()
-
-    if synced_total > 0:
-        console.print(f"[green]✓ Synced {synced_total} new entries from {sessions_synced} sessions[/green]")
-        console.print("[dim]Full-text search is now available for synced content[/dim]")
-    else:
-        console.print("[dim]All transcripts already synced (no new content)[/dim]")
 
 
 if __name__ == "__main__":

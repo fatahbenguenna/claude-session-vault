@@ -606,6 +606,7 @@ class SessionBrowser(App):
                                 'project': cr['project_name'] or 'Unknown',
                                 'title': f"[Content match: {search_query}]",
                                 'last_activity': dt,
+                                'relative_time': relative_time(dt),
                                 'message_count': cr['entry_count'],
                                 'transcript_path': None,
                                 'custom_name': cr.get('custom_name', ''),
