@@ -22,19 +22,19 @@ claude-vault
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Browse Sessions (15510)                                                      │
+│ Browse Sessions (71)                                                         │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  🔍 Type to search...                                                        │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │  ▼ Sessions                                                                  │
-│  ├── ▼ fps-api                                                               │
-│  │   ├── Fix authentication bug in login flow                                │
-│  │   │   9 minutes ago · 45 messages                                         │
-│  │   ├── Add Docker multi-env support                                        │
-│  │   │   2 hours ago · 120 messages                                          │
-│  ├── ▼ my-project                                                            │
-│  │   ├── Implement user dashboard                                            │
-│  │   │   yesterday · 89 messages                                             │
+│  ├── 📁 fps-api (12)                                                         │
+│  │   ├── ▸ Fix authentication bug in login flow                              │
+│  │   │     9 minutes ago · 45 msg                                            │
+│  │   ├── ▸ Add Docker multi-env support                                      │
+│  │   │     2 hours ago · 120 msg                                             │
+│  ├── 📁 my-project (3)                                                       │
+│  │   ├── ▸ Implement user dashboard                                          │
+│  │   │     yesterday · 89 msg                                                │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -44,23 +44,33 @@ claude-vault
 |---------|-------------|
 | **Fuzzy Search** | Type to filter by project name or session title |
 | **Content Search** | Type 3+ characters to search inside conversation content |
-| **Full History** | Access 15,000+ sessions even after Claude purges old ones |
+| **Full History** | Access all sessions even after Claude purges old ones |
 | **Preview** | Press `Ctrl+V` to preview session content |
+| **Open in Claude** | From preview, press `o` to resume session in Claude Code |
 | **Export** | Press `Ctrl+E` to export to Markdown |
 | **Rename** | Press `Ctrl+R` to give a session a custom name |
 
 ### Keyboard Shortcuts
 
+**Browser:**
 | Key | Action |
 |-----|--------|
 | `↑` `↓` | Navigate sessions |
-| `Enter` | Select and view session |
-| `Ctrl+V` | Toggle preview panel |
+| `←` `→` | Collapse/expand project groups |
+| `Enter` | Select session |
+| `Ctrl+V` | Open preview |
 | `Ctrl+E` | Export to Markdown |
 | `Ctrl+J` | Export to JSON |
 | `Ctrl+R` | Rename session |
-| `Ctrl+A` | Toggle expand/collapse all |
-| `Esc` / `q` | Quit |
+| `Esc` | Quit |
+
+**Preview panel:**
+| Key | Action |
+|-----|--------|
+| `e` | Export to Markdown file |
+| `c` | Copy to clipboard |
+| `o` / `Enter` | Open in Claude Code |
+| `Esc` | Close preview |
 
 ## Why Claude Session Vault?
 
@@ -233,14 +243,14 @@ CREATE TABLE transcript_entries (
 ## Uninstall
 
 ```bash
-# Remove hooks
-python -c "from claude_vault.installer import uninstall_hooks; uninstall_hooks()"
+# Complete uninstall (removes hooks and database)
+claude-vault uninstall
 
-# Uninstall
+# Or keep the database for later
+claude-vault uninstall --keep-db
+
+# Then remove the package
 pipx uninstall claude-session-vault
-
-# Remove database (optional)
-rm ~/.claude/vault.db
 ```
 
 ## Requirements
