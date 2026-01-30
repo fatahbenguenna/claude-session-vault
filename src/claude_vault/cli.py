@@ -21,6 +21,8 @@ from claude_vault.db import (
     get_session_events,
     get_stats,
     get_db_path,
+    get_transcript_entries,
+    sync_transcript_entries,
 )
 
 console = Console()
@@ -378,6 +380,8 @@ def stats(as_json: bool):
 
     table.add_row("Total Sessions", str(data.get('total_sessions', 0)))
     table.add_row("Total Events", str(data.get('total_events', 0)))
+    table.add_row("Transcript Entries", str(data.get('total_transcript_entries', 0)))
+    table.add_row("Sessions with Full Transcript", str(data.get('sessions_with_transcripts', 0)))
     table.add_row("Database Size", f"{data.get('db_size_mb', 0)} MB")
 
     console.print(table)
@@ -472,12 +476,75 @@ def parse_jsonl_transcript(transcript_path: str) -> list:
     return messages
 
 
+def parse_db_transcript_entries(entries: list) -> list:
+    """Convert database transcript entries to conversation format using raw_json."""
+    messages = []
+
+    for entry in entries:
+        raw_json = entry.get('raw_json')
+        if not raw_json:
+            continue
+
+        try:
+            data = json.loads(raw_json)
+            msg_type = data.get('type')
+
+            if msg_type == 'user':
+                message = data.get('message', {})
+                content = message.get('content', '')
+                if isinstance(content, list):
+                    content = '\n'.join(
+                        block.get('text', '') for block in content
+                        if isinstance(block, dict) and block.get('type') == 'text'
+                    )
+                if content:
+                    messages.append({
+                        'role': 'user',
+                        'content': content,
+                        'timestamp': data.get('timestamp', '')
+                    })
+
+            elif msg_type == 'assistant':
+                message = data.get('message', {})
+                content_blocks = message.get('content', [])
+
+                text_parts = []
+                tool_uses = []
+
+                for block in content_blocks:
+                    if isinstance(block, dict):
+                        if block.get('type') == 'text':
+                            text_parts.append(block.get('text', ''))
+                        elif block.get('type') == 'tool_use':
+                            tool_uses.append({
+                                'name': block.get('name', 'unknown'),
+                                'input': block.get('input', {})
+                            })
+
+                if text_parts or tool_uses:
+                    messages.append({
+                        'role': 'assistant',
+                        'content': '\n'.join(text_parts),
+                        'tool_uses': tool_uses,
+                        'timestamp': data.get('timestamp', '')
+                    })
+
+        except json.JSONDecodeError:
+            continue
+
+    return messages
+
+
 @main.command()
 @click.argument("output_path", type=click.Path())
 @click.option("-s", "--session", required=True, help="Session ID to export")
 @click.option("-f", "--format", "fmt", type=click.Choice(['json', 'md', 'txt']), default='md')
 def export(output_path: str, session: str, fmt: str):
-    """Export a session to a file (reads full transcript for complete conversation).
+    """Export a session to a file (reads from vault database, independent of JSONL files).
+
+    \b
+    The vault stores full conversation content in its database, so exports work
+    even if Claude's JSONL files are deleted or the machine was restored.
 
     \b
     Examples:
@@ -522,10 +589,28 @@ def export(output_path: str, session: str, fmt: str):
 
     output = Path(output_path)
 
-    # Try to parse the JSONL transcript for full conversation
+    # Strategy: Try database first (independent), then fallback to JSONL
     messages = []
-    if transcript_path:
+
+    # 1. First try to get from database (independent of JSONL files)
+    db_entries = get_transcript_entries(full_session_id)
+    if db_entries:
+        messages = parse_db_transcript_entries(db_entries)
+        console.print(f"[dim]Using {len(db_entries)} entries from vault database[/dim]")
+
+    # 2. If no database entries, try to sync from JSONL and retry
+    if not messages and transcript_path:
+        synced = sync_transcript_entries(full_session_id, transcript_path)
+        if synced > 0:
+            console.print(f"[dim]Synced {synced} entries from JSONL to database[/dim]")
+            db_entries = get_transcript_entries(full_session_id)
+            messages = parse_db_transcript_entries(db_entries)
+
+    # 3. Final fallback: direct JSONL parsing (for backward compatibility)
+    if not messages and transcript_path:
         messages = parse_jsonl_transcript(transcript_path)
+        if messages:
+            console.print(f"[yellow]Warning: Using JSONL directly (not synced to vault)[/yellow]")
 
     if fmt == 'json':
         output.write_text(json.dumps(messages, indent=2, default=str, ensure_ascii=False))
@@ -686,6 +771,77 @@ def path():
 
 
 @main.command()
+@click.option("-s", "--session", default=None, help="Sync a specific session ID")
+@click.option("-a", "--all", "sync_all", is_flag=True, help="Sync all known sessions")
+def sync(session: Optional[str], sync_all: bool):
+    """Sync transcript content from JSONL files to the vault database.
+
+    This makes your session data independent of Claude's JSONL files,
+    so exports work even if the original files are deleted.
+
+    \b
+    Examples:
+        claude-vault sync --session abc123    # Sync specific session
+        claude-vault sync --all               # Sync all known sessions
+    """
+    from claude_vault.db import get_connection
+
+    if not session and not sync_all:
+        console.print("[yellow]Specify --session <id> or --all[/yellow]")
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if session:
+        # Sync single session
+        cursor.execute("""
+            SELECT DISTINCT session_id, transcript_path
+            FROM events
+            WHERE session_id LIKE ? AND transcript_path IS NOT NULL
+            LIMIT 1
+        """, (f"{session}%",))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            console.print(f"[red]Session '{session}' not found or has no transcript path[/red]")
+            return
+
+        full_session_id, transcript_path = row[0], row[1]
+        synced = sync_transcript_entries(full_session_id, transcript_path)
+        console.print(f"[green]Synced {synced} new entries for session {full_session_id[:8]}[/green]")
+
+    else:
+        # Sync all sessions
+        cursor.execute("""
+            SELECT DISTINCT session_id, transcript_path
+            FROM events
+            WHERE transcript_path IS NOT NULL
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            console.print("[yellow]No sessions with transcript paths found[/yellow]")
+            return
+
+        total_synced = 0
+        sessions_synced = 0
+
+        with console.status("[bold green]Syncing sessions...") as status:
+            for row in rows:
+                session_id, transcript_path = row[0], row[1]
+                status.update(f"[bold green]Syncing {session_id[:8]}...")
+                synced = sync_transcript_entries(session_id, transcript_path)
+                if synced > 0:
+                    total_synced += synced
+                    sessions_synced += 1
+
+        console.print(f"[green]✅ Synced {total_synced} entries across {sessions_synced} sessions[/green]")
+
+
+@main.command()
 def update():
     """Update claude-session-vault to the latest version from GitHub."""
     import subprocess
@@ -814,6 +970,84 @@ def browse(ctx, project: Optional[str]):
         console.print(f"[red]Error: {e}[/red]")
         import traceback
         traceback.print_exc()
+
+
+@main.command()
+@click.option("--all", "sync_all", is_flag=True, help="Sync all sessions, not just those in the vault")
+def sync(sync_all: bool):
+    """Sync transcript content from JSONL files into the vault database.
+
+    \b
+    This enables full-text search in session content. By default, only syncs
+    sessions already tracked in the vault. Use --all to scan Claude's project
+    directories for any JSONL files.
+
+    \b
+    Examples:
+        claude-vault sync        # Sync tracked sessions
+        claude-vault sync --all  # Scan and sync all JSONL files
+    """
+    from claude_vault.db import (
+        get_connection,
+        sync_transcript_entries,
+        init_db,
+    )
+
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    synced_total = 0
+    sessions_synced = 0
+
+    if sync_all:
+        # Scan Claude's project directories
+        claude_projects = Path.home() / ".claude" / "projects"
+        if claude_projects.exists():
+            jsonl_files = list(claude_projects.rglob("*.jsonl"))
+            console.print(f"[cyan]Found {len(jsonl_files)} JSONL files to scan...[/cyan]")
+
+            with console.status("[bold green]Syncing transcripts...") as status:
+                for jsonl_file in jsonl_files:
+                    session_id = jsonl_file.stem
+                    try:
+                        new_entries = sync_transcript_entries(session_id, str(jsonl_file))
+                        if new_entries > 0:
+                            synced_total += new_entries
+                            sessions_synced += 1
+                            status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: {jsonl_file.name}: {e}[/yellow]")
+        else:
+            console.print("[yellow]No Claude projects directory found[/yellow]")
+    else:
+        # Only sync sessions already in the vault
+        cursor.execute("""
+            SELECT DISTINCT session_id, transcript_path
+            FROM events
+            WHERE transcript_path IS NOT NULL
+        """)
+        sessions = cursor.fetchall()
+        console.print(f"[cyan]Found {len(sessions)} tracked sessions to sync...[/cyan]")
+
+        with console.status("[bold green]Syncing transcripts...") as status:
+            for session_id, transcript_path in sessions:
+                try:
+                    new_entries = sync_transcript_entries(session_id, transcript_path)
+                    if new_entries > 0:
+                        synced_total += new_entries
+                        sessions_synced += 1
+                        status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
+                except Exception as e:
+                    pass  # Skip errors silently for tracked sessions
+
+    conn.close()
+
+    if synced_total > 0:
+        console.print(f"[green]✓ Synced {synced_total} new entries from {sessions_synced} sessions[/green]")
+        console.print("[dim]Full-text search is now available for synced content[/dim]")
+    else:
+        console.print("[dim]All transcripts already synced (no new content)[/dim]")
 
 
 if __name__ == "__main__":

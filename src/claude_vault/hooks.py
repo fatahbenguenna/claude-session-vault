@@ -10,7 +10,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from claude_vault.db import init_db, insert_event, end_session
+from claude_vault.db import init_db, insert_event, end_session, sync_transcript_entries
 
 
 def process_hook_input() -> dict:
@@ -64,6 +64,12 @@ def main():
 
         # Insert event into database
         insert_event(event)
+
+        # Sync transcript entries incrementally
+        session_id = input_data.get('session_id')
+        transcript_path = input_data.get('transcript_path')
+        if session_id and transcript_path:
+            sync_transcript_entries(session_id, transcript_path)
 
         # Output empty JSON to not block Claude
         print(json.dumps({}))

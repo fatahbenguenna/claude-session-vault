@@ -98,6 +98,51 @@ def init_db(db_path: Optional[Path] = None) -> None:
 
     # Indexes for faster queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)")
+
+    # Transcript entries table - stores full conversation incrementally
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transcript_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            line_number INTEGER NOT NULL,
+            entry_type TEXT,
+            role TEXT,
+            content TEXT,
+            raw_json TEXT,
+            timestamp TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(session_id, line_number)
+        )
+    """)
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_transcript_session ON transcript_entries(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_transcript_type ON transcript_entries(entry_type)")
+
+    # Full-text search for transcript content
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+            session_id,
+            role,
+            content,
+            content='transcript_entries',
+            content_rowid='id'
+        )
+    """)
+
+    # Triggers to keep transcript FTS in sync
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS transcript_ai AFTER INSERT ON transcript_entries BEGIN
+            INSERT INTO transcript_fts(rowid, session_id, role, content)
+            VALUES (new.id, new.session_id, new.role, new.content);
+        END
+    """)
+
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS transcript_ad AFTER DELETE ON transcript_entries BEGIN
+            INSERT INTO transcript_fts(transcript_fts, rowid, session_id, role, content)
+            VALUES ('delete', old.id, old.session_id, old.role, old.content);
+        END
+    """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_name)")
@@ -272,6 +317,13 @@ def get_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
     cursor.execute("SELECT COUNT(*) FROM events")
     stats['total_events'] = cursor.fetchone()[0]
 
+    # Transcript entries stats
+    cursor.execute("SELECT COUNT(*) FROM transcript_entries")
+    stats['total_transcript_entries'] = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(DISTINCT session_id) FROM transcript_entries")
+    stats['sessions_with_transcripts'] = cursor.fetchone()[0]
+
     cursor.execute("""
         SELECT event_type, COUNT(*) as count
         FROM events
@@ -350,3 +402,219 @@ def get_session_custom_name(session_id: str, db_path: Optional[Path] = None) -> 
     if row and row[0]:
         return row[0]
     return None
+
+
+def get_last_synced_line(session_id: str, db_path: Optional[Path] = None) -> int:
+    """Get the last synced line number for a session."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT MAX(line_number) FROM transcript_entries WHERE session_id = ?",
+        (session_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    return row[0] if row and row[0] is not None else -1
+
+
+def sync_transcript_entries(
+    session_id: str,
+    transcript_path: Optional[str] = None,
+    db_path: Optional[Path] = None
+) -> int:
+    """
+    Sync new transcript entries from JSONL file to database.
+
+    Returns the number of new entries synced.
+    """
+    if not transcript_path:
+        # Try to find transcript path from events
+        conn = get_connection(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT transcript_path FROM events WHERE session_id = ? AND transcript_path IS NOT NULL LIMIT 1",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            transcript_path = row[0]
+        else:
+            return 0
+
+    jsonl_file = Path(transcript_path)
+    if not jsonl_file.exists():
+        return 0
+
+    last_line = get_last_synced_line(session_id, db_path)
+    new_entries = 0
+
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    try:
+        with open(jsonl_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f):
+                # Skip already synced lines
+                if line_num <= last_line:
+                    continue
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Extract entry metadata
+                entry_type = entry.get('type')
+                role = entry.get('message', {}).get('role') if entry.get('message') else None
+
+                # Extract content based on entry type
+                content = None
+                if entry_type == 'user' and entry.get('message'):
+                    msg = entry['message']
+                    if isinstance(msg.get('content'), str):
+                        content = msg['content']
+                    elif isinstance(msg.get('content'), list):
+                        # Extract text from content blocks
+                        texts = []
+                        for block in msg['content']:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                texts.append(block.get('text', ''))
+                            elif isinstance(block, str):
+                                texts.append(block)
+                        content = '\n'.join(texts) if texts else None
+                elif entry_type == 'assistant' and entry.get('message'):
+                    msg = entry['message']
+                    if isinstance(msg.get('content'), list):
+                        texts = []
+                        for block in msg['content']:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                texts.append(block.get('text', ''))
+                        content = '\n'.join(texts) if texts else None
+                elif entry_type == 'summary':
+                    content = entry.get('summary')
+
+                # Get timestamp
+                timestamp = entry.get('timestamp')
+
+                # Insert entry
+                cursor.execute("""
+                    INSERT OR IGNORE INTO transcript_entries
+                    (session_id, line_number, entry_type, role, content, raw_json, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    line_num,
+                    entry_type,
+                    role,
+                    content,
+                    line,  # Store raw JSON for full reconstruction
+                    timestamp
+                ))
+
+                if cursor.rowcount > 0:
+                    new_entries += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return new_entries
+
+
+def get_transcript_entries(
+    session_id: str,
+    db_path: Optional[Path] = None
+) -> List[Dict[str, Any]]:
+    """Get all transcript entries for a session from the database."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM transcript_entries
+        WHERE session_id = ?
+        ORDER BY line_number ASC
+    """, (session_id,))
+
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return results
+
+
+def search_transcripts(
+    query: str,
+    limit: int = 50,
+    db_path: Optional[Path] = None
+) -> List[Dict[str, Any]]:
+    """Search transcript content across all sessions using FTS5."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Try FTS5 search first (fast)
+        cursor.execute("""
+            SELECT t.*, s.project_name, s.custom_name
+            FROM transcript_entries t
+            JOIN sessions s ON t.session_id = s.session_id
+            JOIN transcript_fts fts ON t.id = fts.rowid
+            WHERE transcript_fts MATCH ?
+            ORDER BY t.timestamp DESC
+            LIMIT ?
+        """, (query, limit))
+    except sqlite3.OperationalError:
+        # Fallback to LIKE if FTS table doesn't exist yet
+        cursor.execute("""
+            SELECT t.*, s.project_name, s.custom_name
+            FROM transcript_entries t
+            JOIN sessions s ON t.session_id = s.session_id
+            WHERE t.content LIKE ?
+            ORDER BY t.timestamp DESC
+            LIMIT ?
+        """, (f"%{query}%", limit))
+
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return results
+
+
+def search_sessions_by_content(
+    query: str,
+    limit: int = 20,
+    db_path: Optional[Path] = None
+) -> List[str]:
+    """Search and return unique session IDs that contain the query in their content."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Try FTS5 search first
+        cursor.execute("""
+            SELECT DISTINCT t.session_id
+            FROM transcript_entries t
+            JOIN transcript_fts fts ON t.id = fts.rowid
+            WHERE transcript_fts MATCH ?
+            ORDER BY t.timestamp DESC
+            LIMIT ?
+        """, (query, limit))
+    except sqlite3.OperationalError:
+        # Fallback to LIKE
+        cursor.execute("""
+            SELECT DISTINCT session_id
+            FROM transcript_entries
+            WHERE content LIKE ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (f"%{query}%", limit))
+
+    results = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    return results

@@ -34,6 +34,7 @@ from claude_vault.db import (
     get_connection,
     rename_session,
     get_session_custom_name,
+    search_sessions_by_content,
 )
 
 
@@ -433,7 +434,7 @@ class SessionBrowser(App):
         tree.focus()
 
     def load_sessions(self, search_query: str = "") -> None:
-        """Load and display sessions."""
+        """Load and display sessions, searching in content when query >= 3 chars."""
         if not self.all_sessions:
             self.all_sessions = get_enriched_sessions(limit=100)
 
@@ -443,7 +444,21 @@ class SessionBrowser(App):
             sessions = [s for s in sessions if self.project_filter.lower() in s['project'].lower()]
         if search_query:
             q = search_query.lower()
-            sessions = [s for s in sessions if q in s['title'].lower() or q in s['project'].lower()]
+            # First, filter by title/project (fast)
+            title_matches = [s for s in sessions if q in s['title'].lower() or q in s['project'].lower()]
+
+            # If query is 3+ chars, also search in content (full-text)
+            content_match_ids = set()
+            if len(search_query) >= 3:
+                try:
+                    content_match_ids = set(search_sessions_by_content(search_query, limit=50))
+                except Exception:
+                    pass  # FTS table might not exist yet
+
+            # Combine: sessions matching title OR content
+            title_match_ids = {s['session_id'] for s in title_matches}
+            all_match_ids = title_match_ids | content_match_ids
+            sessions = [s for s in sessions if s['session_id'] in all_match_ids]
 
         # Update header
         header = self.query_one("#header", Static)
