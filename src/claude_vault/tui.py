@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Interactive TUI browser for Claude Session Vault using Textual."""
+"""Interactive TUI browser for Claude Session Vault using Textual.
+
+Features:
+- Real-time search filtering
+- Arrow key navigation
+- Keyboard shortcuts for export
+"""
 
 import json
 from pathlib import Path
@@ -8,31 +14,29 @@ from typing import Optional, List, Dict, Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Footer, Input, Static, ListItem, ListView
-from textual.containers import Container, Vertical, Horizontal
+from textual.widgets import Input, Static, ListView, ListItem, Label
+from textual.containers import Container, Vertical
 from textual.reactive import reactive
 from textual import on
 from rich.text import Text
-from rich.console import RenderableType
 
 from claude_vault.db import (
     init_db,
     list_sessions,
     get_session_events,
-    search_events,
-    get_db_path,
     get_connection,
 )
 
 
 def relative_time(dt: datetime) -> str:
-    """Convert datetime to human-readable relative time like '2 minutes ago'."""
+    """Convert datetime to human-readable relative time."""
     now = datetime.now()
     diff = now - dt
-
     seconds = diff.total_seconds()
 
-    if seconds < 60:
+    if seconds < 0:
+        return "just now"
+    elif seconds < 60:
         n = int(seconds)
         return f"{n} second{'s' if n != 1 else ''} ago"
     elif seconds < 3600:
@@ -54,7 +58,6 @@ def relative_time(dt: datetime) -> str:
 
 def get_session_title(session_id: str, transcript_path: Optional[str] = None) -> str:
     """Get the first user prompt as session title."""
-    # Try to read from transcript
     if transcript_path:
         path = Path(transcript_path)
         if path.exists():
@@ -71,10 +74,9 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
                                         for item in content:
                                             if isinstance(item, dict) and item.get('type') == 'text':
                                                 text = item.get('text', '')
-                                                # Truncate and clean
-                                                text = text.strip().replace('\n', ' ')[:80]
-                                                if len(text) > 77:
-                                                    text = text[:77] + "..."
+                                                text = text.strip().replace('\n', ' ')[:100]
+                                                if len(text) > 97:
+                                                    text = text[:97] + "..."
                                                 return text
                         except json.JSONDecodeError:
                             continue
@@ -85,23 +87,23 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
     events = get_session_events(session_id, limit=5)
     for event in events:
         if event.get('event_type') == 'UserPromptSubmit' and event.get('prompt'):
-            text = event['prompt'].strip().replace('\n', ' ')[:80]
-            if len(text) > 77:
-                text = text[:77] + "..."
+            text = event['prompt'].strip().replace('\n', ' ')[:100]
+            if len(text) > 97:
+                text = text[:97] + "..."
             return text
 
     return "No title available"
 
 
-def get_enriched_sessions() -> List[Dict[str, Any]]:
-    """Get sessions with enriched data (title, relative time, message count)."""
-    sessions = list_sessions()
+def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
+    """Get sessions with enriched data."""
+    sessions = list_sessions(limit=limit)
     enriched = []
 
     for session in sessions:
         session_id = session['session_id']
 
-        # Get transcript path from database
+        # Get transcript path
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -114,14 +116,14 @@ def get_enriched_sessions() -> List[Dict[str, Any]]:
         # Parse last activity time
         last_activity = session.get('last_activity', '')
         try:
-            if 'T' in last_activity:
-                dt = datetime.fromisoformat(last_activity.replace('Z', '+00:00'))
+            if 'T' in str(last_activity):
+                dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
             else:
-                dt = datetime.strptime(last_activity, '%Y-%m-%d %H:%M:%S')
+                dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
         except:
             dt = datetime.now()
 
-        # Get message count from transcript
+        # Get message count
         message_count = 0
         if transcript_path:
             path = Path(transcript_path)
@@ -134,13 +136,11 @@ def get_enriched_sessions() -> List[Dict[str, Any]]:
         if message_count == 0:
             message_count = session.get('event_count', 0)
 
-        # Extract project name from various sources
+        # Extract project name
         project_name = session.get('project_name') or session.get('project')
         if not project_name and transcript_path:
-            # Extract from transcript path: ~/.claude/projects/-Users-xxx-project/session.jsonl
             try:
                 parts = Path(transcript_path).parent.name
-                # Convert -Users-fatah-project to project
                 if parts.startswith('-'):
                     project_name = parts.split('-')[-1]
                 else:
@@ -160,121 +160,98 @@ def get_enriched_sessions() -> List[Dict[str, Any]]:
             'transcript_path': transcript_path,
         })
 
-    # Sort by most recent
     enriched.sort(key=lambda x: x['last_activity'], reverse=True)
     return enriched
 
 
 class SessionItem(ListItem):
-    """A single session item in the list."""
+    """A session item in the list."""
 
-    def __init__(self, session: Dict[str, Any], index: int, total: int) -> None:
+    def __init__(self, session: Dict[str, Any]) -> None:
         super().__init__()
         self.session = session
-        self.index = index
-        self.total = total
 
     def compose(self) -> ComposeResult:
+        """Compose the session item."""
         title = self.session['title']
         time_ago = self.session['relative_time']
         msg_count = self.session['message_count']
         project = self.session['project']
 
-        # Create the display
-        yield Static(
-            Text.assemble(
-                ("▸ ", "bold cyan"),
-                (title, "bold white"),
-            ),
-            classes="session-title"
-        )
-        yield Static(
-            Text.assemble(
-                (f"  {time_ago}", "dim"),
-                (" · ", "dim"),
-                (f"{msg_count} messages", "dim"),
-                (" · ", "dim"),
-                (project, "dim cyan"),
-            ),
-            classes="session-meta"
-        )
+        yield Label(Text(f"▸ {title}", style="bold"))
+        yield Label(Text(f"  {time_ago} · {msg_count} messages · {project}", style="dim"))
 
 
 class SessionBrowser(App):
-    """Textual app for browsing Claude sessions."""
+    """TUI for browsing Claude sessions."""
 
     CSS = """
     Screen {
-        background: $surface;
+        background: #1e1e1e;
     }
 
-    #header-container {
-        height: 3;
-        background: $primary;
+    #header {
+        height: 1;
+        background: #0078d4;
+        color: white;
         padding: 0 1;
-    }
-
-    #header-title {
-        color: $text;
         text-style: bold;
     }
 
-    #search-container {
-        height: 3;
+    #search-box {
+        height: 1;
+        background: #2d2d2d;
         padding: 0 1;
-        background: $surface-darken-1;
     }
 
     #search-input {
+        background: #2d2d2d;
         border: none;
-        background: $surface-darken-2;
-        padding: 0 1;
+        height: 1;
     }
 
     #search-input:focus {
         border: none;
     }
 
-    #sessions-list {
+    #session-list {
         height: 1fr;
+        background: #1e1e1e;
+    }
+
+    #session-list > ListItem {
         padding: 0 1;
-    }
-
-    SessionItem {
         height: auto;
-        padding: 0 0 1 0;
     }
 
-    SessionItem:hover {
-        background: $surface-lighten-1;
+    #session-list > ListItem:hover {
+        background: #2d2d2d;
     }
 
-    SessionItem.-selected {
-        background: $primary-darken-1;
+    #session-list > ListItem.-selected {
+        background: #094771;
     }
 
-    .session-title {
+    #session-list > ListItem Label {
+        width: 100%;
+    }
+
+    #footer {
         height: 1;
-    }
-
-    .session-meta {
-        height: 1;
-    }
-
-    #footer-help {
-        height: 1;
-        background: $surface-darken-2;
-        color: $text-muted;
+        background: #2d2d2d;
+        color: #888888;
         padding: 0 1;
     }
     """
 
     BINDINGS = [
         Binding("escape", "quit", "Exit"),
-        Binding("enter", "select_session", "Select"),
+        Binding("enter", "select", "Select"),
         Binding("ctrl+e", "export_md", "Export MD"),
         Binding("ctrl+j", "export_json", "Export JSON"),
-        Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+r", "refresh", "Refresh"),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
     ]
 
     def __init__(self, project_filter: Optional[str] = None):
@@ -282,117 +259,120 @@ class SessionBrowser(App):
         self.project_filter = project_filter
         self.all_sessions: List[Dict[str, Any]] = []
         self.filtered_sessions: List[Dict[str, Any]] = []
-        self.selected_session: Optional[Dict[str, Any]] = None
 
     def compose(self) -> ComposeResult:
-        yield Container(
-            Static("Browse Sessions", id="header-title"),
-            id="header-container"
-        )
-        yield Container(
-            Input(placeholder="🔍 Search...", id="search-input"),
-            id="search-container"
-        )
-        yield ListView(id="sessions-list")
-        yield Static(
-            "Enter: select · Ctrl+E: export MD · Ctrl+J: export JSON · Esc: quit · Type to search",
-            id="footer-help"
-        )
+        yield Static("Browse Sessions", id="header")
+        yield Container(Input(placeholder="🔍 Type to search...", id="search-input"), id="search-box")
+        yield ListView(id="session-list")
+        yield Static("↑↓: navigate · Enter: select · Ctrl+E: export MD · Ctrl+J: export JSON · Esc: quit", id="footer")
 
     def on_mount(self) -> None:
-        """Load sessions when app starts."""
+        """Initialize on mount."""
         init_db()
         self.load_sessions()
-        self.query_one("#search-input", Input).focus()
+        # Focus the list for arrow key navigation
+        self.query_one("#session-list", ListView).focus()
 
     def load_sessions(self, search_query: str = "") -> None:
         """Load and filter sessions."""
         if not self.all_sessions:
-            self.all_sessions = get_enriched_sessions()
+            self.all_sessions = get_enriched_sessions(limit=100)
 
-        # Filter by project if specified
+        # Apply filters
         sessions = self.all_sessions
+
         if self.project_filter:
             sessions = [s for s in sessions if self.project_filter.lower() in s['project'].lower()]
 
-        # Filter by search query
         if search_query:
-            query_lower = search_query.lower()
+            q = search_query.lower()
             sessions = [
                 s for s in sessions
-                if query_lower in s['title'].lower()
-                or query_lower in s['project'].lower()
+                if q in s['title'].lower() or q in s['project'].lower()
             ]
 
         self.filtered_sessions = sessions
-        self.update_session_list()
-        self.update_header()
 
-    def update_header(self) -> None:
-        """Update header with count."""
+        # Update header
+        header = self.query_one("#header", Static)
         total = len(self.all_sessions)
         filtered = len(self.filtered_sessions)
-        header = self.query_one("#header-title", Static)
         if filtered == total:
             header.update(f"Browse Sessions ({total})")
         else:
             header.update(f"Browse Sessions ({filtered} of {total})")
 
-    def update_session_list(self) -> None:
-        """Update the ListView with filtered sessions."""
-        list_view = self.query_one("#sessions-list", ListView)
+        # Update list
+        list_view = self.query_one("#session-list", ListView)
         list_view.clear()
 
-        for i, session in enumerate(self.filtered_sessions):
-            item = SessionItem(session, i + 1, len(self.filtered_sessions))
+        for session in self.filtered_sessions:
+            item = SessionItem(session)
             list_view.append(item)
 
     @on(Input.Changed, "#search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
-        """Handle search input changes."""
+        """Handle search input."""
         self.load_sessions(event.value)
+        # Refocus list after filtering
+        self.query_one("#session-list", ListView).focus()
 
-    @on(ListView.Selected, "#sessions-list")
-    def on_session_selected(self, event: ListView.Selected) -> None:
-        """Handle session selection."""
-        if event.item and isinstance(event.item, SessionItem):
-            self.selected_session = event.item.session
-            self.show_session_actions()
+    def action_cursor_up(self) -> None:
+        """Move cursor up."""
+        list_view = self.query_one("#session-list", ListView)
+        list_view.action_cursor_up()
 
-    def action_select_session(self) -> None:
+    def action_cursor_down(self) -> None:
+        """Move cursor down."""
+        list_view = self.query_one("#session-list", ListView)
+        list_view.action_cursor_down()
+
+    def action_select(self) -> None:
         """Select the highlighted session."""
-        list_view = self.query_one("#sessions-list", ListView)
+        list_view = self.query_one("#session-list", ListView)
         if list_view.highlighted_child and isinstance(list_view.highlighted_child, SessionItem):
-            self.selected_session = list_view.highlighted_child.session
-            self.show_session_actions()
+            self.exit(list_view.highlighted_child.session)
 
-    def show_session_actions(self) -> None:
-        """Show actions for selected session."""
-        if self.selected_session:
-            # For now, just exit with the selected session
-            self.exit(self.selected_session)
+    @on(ListView.Selected, "#session-list")
+    def on_list_selected(self, event: ListView.Selected) -> None:
+        """Handle list selection."""
+        if isinstance(event.item, SessionItem):
+            self.exit(event.item.session)
 
     def action_export_md(self) -> None:
-        """Export selected session to Markdown."""
-        list_view = self.query_one("#sessions-list", ListView)
+        """Export selected to Markdown."""
+        list_view = self.query_one("#session-list", ListView)
         if list_view.highlighted_child and isinstance(list_view.highlighted_child, SessionItem):
-            session = list_view.highlighted_child.session
-            self.exit({"action": "export_md", "session": session})
+            self.exit({"action": "export_md", "session": list_view.highlighted_child.session})
 
     def action_export_json(self) -> None:
-        """Export selected session to JSON."""
-        list_view = self.query_one("#sessions-list", ListView)
+        """Export selected to JSON."""
+        list_view = self.query_one("#session-list", ListView)
         if list_view.highlighted_child and isinstance(list_view.highlighted_child, SessionItem):
-            session = list_view.highlighted_child.session
-            self.exit({"action": "export_json", "session": session})
+            self.exit({"action": "export_json", "session": list_view.highlighted_child.session})
+
+    def action_refresh(self) -> None:
+        """Refresh sessions."""
+        self.all_sessions = []
+        search = self.query_one("#search-input", Input).value
+        self.load_sessions(search)
 
     def action_quit(self) -> None:
-        """Quit the app."""
+        """Quit."""
         self.exit(None)
+
+    def on_key(self, event) -> None:
+        """Capture typing to search."""
+        search_input = self.query_one("#search-input", Input)
+        # If user types a letter and search isn't focused, focus it and add the character
+        if event.character and event.character.isprintable() and not search_input.has_focus:
+            search_input.focus()
+            search_input.value += event.character
+            search_input.cursor_position = len(search_input.value)
 
 
 def run_browser(project_filter: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Run the TUI browser and return selected session."""
+    """Run the TUI browser."""
     app = SessionBrowser(project_filter=project_filter)
     return app.run()
 
