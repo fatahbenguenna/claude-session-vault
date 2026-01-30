@@ -1,26 +1,95 @@
 # Claude Session Vault 🗄️
 
-Persist and search all your Claude Code sessions in a local SQLite database.
+Persist, browse, and search all your Claude Code sessions in a local SQLite database.
 
-## Features
+## Quick Start
 
-- **Automatic persistence** - All prompts, tool uses, and responses are saved
-- **Full-text search** - Find anything from any session instantly
-- **Session browser** - Navigate through your Claude Code history
-- **Export** - Export sessions to Markdown, JSON, or text
-- **Statistics** - See your usage patterns and top tools
-- **Zero config** - Just install and go
+```bash
+# Install
+pipx install git+https://github.com/fatahbenguenna/claude-session-vault.git
+claude-vault-install
+
+# Sync existing sessions (one-time, optional)
+claude-vault sync --all
+
+# Launch the interactive browser
+claude-vault
+```
+
+## The Interactive Browser
+
+**`claude-vault` (or `claude-vault browse`)** is the heart of the application. It provides a TUI similar to `claude --resume` but with powerful search capabilities.
+
+```
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Browse Sessions (15510)                                                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  🔍 Type to search...                                                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  ▼ Sessions                                                                  │
+│  ├── ▼ fps-api                                                               │
+│  │   ├── Fix authentication bug in login flow                                │
+│  │   │   9 minutes ago · 45 messages                                         │
+│  │   ├── Add Docker multi-env support                                        │
+│  │   │   2 hours ago · 120 messages                                          │
+│  ├── ▼ my-project                                                            │
+│  │   ├── Implement user dashboard                                            │
+│  │   │   yesterday · 89 messages                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Fuzzy Search** | Type to filter by project name or session title |
+| **Content Search** | Type 3+ characters to search inside conversation content |
+| **Full History** | Access 15,000+ sessions even after Claude purges old ones |
+| **Preview** | Press `Ctrl+V` to preview session content |
+| **Export** | Press `Ctrl+E` to export to Markdown |
+| **Rename** | Press `Ctrl+R` to give a session a custom name |
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | Navigate sessions |
+| `Enter` | Select and view session |
+| `Ctrl+V` | Toggle preview panel |
+| `Ctrl+E` | Export to Markdown |
+| `Ctrl+J` | Export to JSON |
+| `Ctrl+R` | Rename session |
+| `Ctrl+A` | Toggle expand/collapse all |
+| `Esc` / `q` | Quit |
+
+## Why Claude Session Vault?
+
+| `claude --resume` | `claude-vault` |
+|-------------------|----------------|
+| ✅ Resume sessions | ✅ Browse all history |
+| ❌ Sessions can be purged | ✅ **Permanent archive** |
+| ❌ Search by title only | ✅ **Full-text content search** |
+| ❌ No export | ✅ **Export to Markdown/JSON** |
+| ❌ No statistics | ✅ **Usage analytics** |
+| ❌ Closed format | ✅ **Open SQLite database** |
 
 ## Installation
 
-### Option 1: pip install (recommended)
+### Recommended: pipx
 
 ```bash
-pip install claude-session-vault
+pipx install git+https://github.com/fatahbenguenna/claude-session-vault.git
 claude-vault-install
 ```
 
-### Option 2: Install from source
+### Alternative: pip
+
+```bash
+pip install git+https://github.com/fatahbenguenna/claude-session-vault.git
+claude-vault-install
+```
+
+### From source
 
 ```bash
 git clone https://github.com/fatahbenguenna/claude-session-vault.git
@@ -29,44 +98,46 @@ pip install -e .
 claude-vault-install
 ```
 
-### Option 3: One-liner
+## Syncing Existing Sessions
+
+After installation, sync your existing Claude Code history:
 
 ```bash
-pip install claude-session-vault && python -c "from claude_vault.installer import install_hooks; install_hooks()"
+# Sync all JSONL files (recommended first time)
+claude-vault sync --all
+
+# Check what was synced
+claude-vault stats
 ```
 
-## Usage
+This enables full-text search across all your past conversations.
 
-### Search your history
+## Other Commands
+
+### Search
 
 ```bash
 # Full-text search across all sessions
 claude-vault search "authentication bug"
 
+# Interactive mode - select and export from results
+claude-vault search "docker" -i
+
 # Search within a specific session
 claude-vault search "login" --session abc123
-
-# Search only tool uses
-claude-vault search "Edit" --type PostToolUse
-
-# Output as JSON
-claude-vault search "database" --json
 ```
 
-### Browse sessions
+### Sessions List
 
 ```bash
-# List recent sessions
+# List recent sessions (table view)
 claude-vault sessions
 
 # Filter by project
 claude-vault sessions --project fps-api
-
-# Show more sessions
-claude-vault sessions -n 50
 ```
 
-### View a session
+### View Session
 
 ```bash
 # Show all events in a session
@@ -74,145 +145,103 @@ claude-vault show abc123
 
 # Show only user prompts
 claude-vault show abc123 --prompts-only
-
-# Show only tool uses
-claude-vault show abc123 --tools-only
-
-# Output as JSON
-claude-vault show abc123 --json
 ```
 
-### Export sessions
+### Export
 
 ```bash
-# Export to Markdown
+# Export to Markdown (conversation format)
 claude-vault export session.md --session abc123
 
 # Export to JSON
 claude-vault export session.json --session abc123 --format json
-
-# Export to plain text
-claude-vault export session.txt --session abc123 --format txt
 ```
 
 ### Statistics
 
 ```bash
-# View vault statistics
 claude-vault stats
-
-# Output as JSON
-claude-vault stats --json
 ```
 
-### Update
+```
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Claude Session Vault Statistics                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+  Metric                              Value
+ ───────────────────────────────────────────
+  Total Sessions                         39
+  Total Events                         1011
+  Transcript Entries                 149149
+  Sessions with Full Transcript       15510
+  Database Size                   795.01 MB
+
+Top Projects: fps-api (31), luxCaRent (2), claude-session-vault (1)
+Most Used Tools: Bash (417), Read (327), Edit (67)
+```
+
+### Other
 
 ```bash
-# Update to latest version from GitHub
-claude-vault update
+claude-vault path      # Show database location
+claude-vault version   # Show version
+claude-vault update    # Update from GitHub
+claude-vault --help    # All commands
 ```
 
-### Other commands
+## How It Works
 
-```bash
-# Show database path
-claude-vault path
-
-# Show current version
-claude-vault version
-
-# Show installation instructions
-claude-vault install
-
-# Get help
-claude-vault --help
-```
-
-## How it works
-
-Claude Session Vault uses Claude Code's [hooks system](https://docs.anthropic.com/en/docs/claude-code/hooks) to intercept events:
+Claude Session Vault uses Claude Code's [hooks system](https://docs.anthropic.com/en/docs/claude-code/hooks) to capture events in real-time:
 
 1. **SessionStart** - Records when a new session begins
 2. **UserPromptSubmit** - Captures every prompt you send
 3. **PostToolUse** - Records tool executions and results
 4. **SessionEnd** - Marks session as completed
 
-All data is stored locally in `~/.claude/vault.db` (SQLite with FTS5 for fast search).
+Additionally, `sync` command parses Claude's JSONL transcript files to extract full conversation content for search.
 
-## Configuration
+All data is stored locally in `~/.claude/vault.db` (SQLite with FTS5).
 
-The installer adds these hooks to `~/.claude/settings.json`:
+## Database Schema
 
-```json
-{
-  "hooks": {
-    "SessionStart": [{
-      "hooks": [{"type": "command", "command": "claude-vault-hook"}]
-    }],
-    "UserPromptSubmit": [{
-      "hooks": [{"type": "command", "command": "claude-vault-hook"}]
-    }],
-    "PostToolUse": [{
-      "matcher": "*",
-      "hooks": [{"type": "command", "command": "claude-vault-hook"}]
-    }],
-    "SessionEnd": [{
-      "hooks": [{"type": "command", "command": "claude-vault-hook"}]
-    }]
-  }
-}
+```sql
+-- Sessions
+CREATE TABLE sessions (
+    session_id TEXT UNIQUE,
+    project_name TEXT,
+    custom_name TEXT,
+    started_at TIMESTAMP
+);
+
+-- Hook events (with FTS5 search)
+CREATE TABLE events (
+    session_id TEXT,
+    event_type TEXT,
+    tool_name TEXT,
+    prompt TEXT,
+    timestamp TIMESTAMP
+);
+
+-- Full transcript content (with FTS5 search)
+CREATE TABLE transcript_entries (
+    session_id TEXT,
+    role TEXT,
+    content TEXT,
+    timestamp TIMESTAMP
+);
 ```
 
 ## Uninstall
 
 ```bash
-# Remove hooks from Claude Code settings
+# Remove hooks
 python -c "from claude_vault.installer import uninstall_hooks; uninstall_hooks()"
 
-# Uninstall package
-pip uninstall claude-session-vault
+# Uninstall
+pipx uninstall claude-session-vault
 
-# Optionally remove database
+# Remove database (optional)
 rm ~/.claude/vault.db
 ```
-
-## Database Schema
-
-```sql
--- Sessions table
-CREATE TABLE sessions (
-    id INTEGER PRIMARY KEY,
-    session_id TEXT UNIQUE,
-    project_path TEXT,
-    project_name TEXT,
-    started_at TIMESTAMP,
-    ended_at TIMESTAMP
-);
-
--- Events table (with FTS5 for search)
-CREATE TABLE events (
-    id INTEGER PRIMARY KEY,
-    session_id TEXT,
-    event_type TEXT,
-    tool_name TEXT,
-    tool_input TEXT,
-    tool_response TEXT,
-    prompt TEXT,
-    cwd TEXT,
-    transcript_path TEXT,
-    timestamp TIMESTAMP
-);
-```
-
-## Share with friends
-
-Just tell them to run:
-
-```bash
-pipx install git+https://github.com/fatahbenguenna/claude-session-vault.git && claude-vault-install
-```
-
-Or share this repository!
 
 ## Requirements
 
