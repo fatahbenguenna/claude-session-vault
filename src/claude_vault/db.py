@@ -585,6 +585,61 @@ def search_transcripts(
     return results
 
 
+def search_sessions_with_content(
+    query: str,
+    limit: int = 20,
+    db_path: Optional[Path] = None
+) -> List[Dict[str, Any]]:
+    """Search content and return session info with metadata.
+
+    Returns sessions enriched with data from both sessions table (if available)
+    and transcript_entries (always available for synced sessions).
+    """
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # FTS search with LEFT JOIN to include sessions not in sessions table
+        cursor.execute("""
+            SELECT
+                t.session_id,
+                COALESCE(s.project_name, 'Unknown') as project_name,
+                COALESCE(s.custom_name, '') as custom_name,
+                MIN(t.timestamp) as first_activity,
+                MAX(t.timestamp) as last_activity,
+                COUNT(*) as entry_count
+            FROM transcript_entries t
+            LEFT JOIN sessions s ON t.session_id = s.session_id
+            JOIN transcript_fts fts ON t.id = fts.rowid
+            WHERE transcript_fts MATCH ?
+            GROUP BY t.session_id
+            ORDER BY last_activity DESC
+            LIMIT ?
+        """, (query, limit))
+    except sqlite3.OperationalError:
+        # Fallback to LIKE
+        cursor.execute("""
+            SELECT
+                t.session_id,
+                COALESCE(s.project_name, 'Unknown') as project_name,
+                COALESCE(s.custom_name, '') as custom_name,
+                MIN(t.timestamp) as first_activity,
+                MAX(t.timestamp) as last_activity,
+                COUNT(*) as entry_count
+            FROM transcript_entries t
+            LEFT JOIN sessions s ON t.session_id = s.session_id
+            WHERE t.content LIKE ?
+            GROUP BY t.session_id
+            ORDER BY last_activity DESC
+            LIMIT ?
+        """, (f"%{query}%", limit))
+
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return results
+
+
 def search_sessions_by_content(
     query: str,
     limit: int = 20,

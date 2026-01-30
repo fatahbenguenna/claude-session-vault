@@ -35,6 +35,7 @@ from claude_vault.db import (
     rename_session,
     get_session_custom_name,
     search_sessions_by_content,
+    search_sessions_with_content,
 )
 
 
@@ -448,17 +449,42 @@ class SessionBrowser(App):
             title_matches = [s for s in sessions if q in s['title'].lower() or q in s['project'].lower()]
 
             # If query is 3+ chars, also search in content (full-text)
-            content_match_ids = set()
+            content_sessions = []
             if len(search_query) >= 3:
                 try:
-                    content_match_ids = set(search_sessions_by_content(search_query, limit=50))
-                except Exception:
+                    # Get sessions with metadata from content search
+                    content_results = search_sessions_with_content(search_query, limit=50)
+                    existing_ids = {s['session_id'] for s in title_matches}
+
+                    for cr in content_results:
+                        if cr['session_id'] not in existing_ids:
+                            # Parse last_activity to datetime (same as get_enriched_sessions)
+                            last_activity = cr['last_activity']
+                            try:
+                                if last_activity and 'T' in str(last_activity):
+                                    dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
+                                elif last_activity:
+                                    dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
+                                else:
+                                    dt = datetime.now()
+                            except:
+                                dt = datetime.now()
+
+                            # Create session entry for content match
+                            content_sessions.append({
+                                'session_id': cr['session_id'],
+                                'project': cr['project_name'] or 'Unknown',
+                                'title': f"[Content match: {search_query}]",
+                                'last_activity': dt,
+                                'message_count': cr['entry_count'],
+                                'transcript_path': None,
+                                'custom_name': cr.get('custom_name', ''),
+                            })
+                except Exception as e:
                     pass  # FTS table might not exist yet
 
-            # Combine: sessions matching title OR content
-            title_match_ids = {s['session_id'] for s in title_matches}
-            all_match_ids = title_match_ids | content_match_ids
-            sessions = [s for s in sessions if s['session_id'] in all_match_ids]
+            # Combine title matches + content matches
+            sessions = title_matches + content_sessions
 
         # Update header
         header = self.query_one("#header", Static)
