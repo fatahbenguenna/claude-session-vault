@@ -630,6 +630,7 @@ class SessionBrowser(App):
         Binding("ctrl+j", "export_json", "JSON", show=True),
         Binding("ctrl+v", "preview", "Preview", show=True),
         Binding("ctrl+r", "rename", "Rename", show=True),
+        Binding("ctrl+a", "toggle_all", "Fold All", show=True),
         Binding("ctrl+f", "focus_search", "Search", show=False),
         Binding("up", "cursor_up", "Up", show=False, priority=True),
         Binding("down", "cursor_down", "Down", show=False, priority=True),
@@ -642,12 +643,13 @@ class SessionBrowser(App):
         self.project_filter = project_filter
         self.all_sessions: List[Dict[str, Any]] = []
         self.session_nodes: Dict[str, TreeNode] = {}
+        self.all_expanded: bool = True  # Track expand/collapse all state
 
     def compose(self) -> ComposeResult:
         yield Static("Browse Sessions", id="header")
         yield Container(Input(placeholder="🔍 Type to search...", id="search-input"), id="search-box")
         yield Tree("Sessions", id="session-tree")
-        yield Static("↑↓:nav · ←→:fold · Enter:select · ^V:preview · ^R:rename · ^E:export · Esc:quit", id="footer")
+        yield Static("↑↓:nav · ←→:fold · ^A:fold all · Enter:select · ^V:preview · ^E:export · Esc:quit", id="footer")
 
     def on_mount(self) -> None:
         """Initialize."""
@@ -886,6 +888,24 @@ class SessionBrowser(App):
             group = self._find_parent_group(tree.cursor_node)
             if group:
                 group.expand()
+
+    def action_toggle_all(self) -> None:
+        """Toggle expand/collapse all project groups (Ctrl+A)."""
+        tree = self.query_one("#session-tree", Tree)
+
+        # Get all project group nodes (direct children of root)
+        groups = [child for child in tree.root.children if self._is_group_node(child)]
+
+        if self.all_expanded:
+            # Collapse all groups
+            for group in groups:
+                group.collapse()
+            self.all_expanded = False
+        else:
+            # Expand all groups
+            for group in groups:
+                group.expand()
+            self.all_expanded = True
 
     def _is_navigable_node(self, node) -> bool:
         """Check if node is navigable (session or project group, not metadata)."""

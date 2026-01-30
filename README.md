@@ -57,6 +57,7 @@ claude-vault
 |-----|--------|
 | `↑` `↓` | Navigate sessions |
 | `←` `→` | Collapse/expand project groups |
+| `Ctrl+A` | Toggle collapse/expand all groups |
 | `Enter` | Select session |
 | `Ctrl+V` | Open preview |
 | `Ctrl+E` | Export to Markdown |
