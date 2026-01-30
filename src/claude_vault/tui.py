@@ -19,7 +19,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static, Tree, TextArea
 from textual.widgets.tree import TreeNode
-from textual.containers import Container, Vertical, Horizontal
+from textual.containers import Container, Vertical, Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual import on
@@ -111,65 +111,178 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
     return "No title available"
 
 
-def get_session_preview(session_id: str, transcript_path: Optional[str] = None) -> str:
-    """Get a preview of the session content."""
+def get_session_preview(session_id: str, transcript_path: Optional[str] = None, max_messages: int = 20) -> str:
+    """Get a formatted preview of the session content like Claude Code display."""
+    from claude_vault.db import get_transcript_entries
+
     lines = []
 
+    # Try transcript_entries from database first (synced content)
+    entries = get_transcript_entries(session_id)
+    if entries:
+        message_count = 0
+        for entry in entries:
+            if message_count >= max_messages:
+                remaining = len(entries) - message_count
+                if remaining > 0:
+                    lines.append(f"\n[dim]... and {remaining} more entries[/dim]")
+                break
+
+            raw_json = entry.get('raw_json', '')
+            if not raw_json:
+                continue
+
+            try:
+                data = json.loads(raw_json)
+                entry_type = data.get('type', '')
+
+                # User message
+                if entry_type in ('user', 'human'):
+                    message = data.get('message', {})
+                    content = message.get('content', '')
+
+                    # Handle content as list of blocks
+                    if isinstance(content, list):
+                        content = ' '.join(
+                            item.get('text', '') for item in content
+                            if isinstance(item, dict) and item.get('type') == 'text'
+                        )
+
+                    if content:
+                        lines.append("")
+                        lines.append("[bold cyan]━━━ 👤 User ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+                        if len(content) > 500:
+                            lines.append(content[:500] + "...")
+                        else:
+                            lines.append(content)
+                        message_count += 1
+
+                # Assistant message
+                elif entry_type == 'assistant':
+                    message = data.get('message', {})
+                    content_blocks = message.get('content', [])
+
+                    text_parts = []
+                    tool_uses = []
+
+                    for block in content_blocks:
+                        if isinstance(block, dict):
+                            if block.get('type') == 'text':
+                                text_parts.append(block.get('text', ''))
+                            elif block.get('type') == 'tool_use':
+                                tool_name = block.get('name', 'Unknown')
+                                tool_input = block.get('input', {})
+                                tool_uses.append((tool_name, tool_input))
+
+                    if text_parts or tool_uses:
+                        lines.append("")
+                        lines.append("[bold green]━━━ 🤖 Assistant ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold green]")
+
+                        if text_parts:
+                            text = '\n'.join(text_parts)
+                            if len(text) > 500:
+                                lines.append(text[:500] + "...")
+                            else:
+                                lines.append(text)
+
+                        for tool_name, tool_input in tool_uses:
+                            lines.append(f"[bold yellow]⚡ {tool_name}[/bold yellow]")
+                            # Show brief input summary
+                            if isinstance(tool_input, dict):
+                                if 'command' in tool_input:
+                                    cmd = str(tool_input['command'])[:80]
+                                    lines.append(f"[dim]  $ {cmd}{'...' if len(str(tool_input.get('command', ''))) > 80 else ''}[/dim]")
+                                elif 'file_path' in tool_input:
+                                    lines.append(f"[dim]  📄 {tool_input['file_path']}[/dim]")
+                                elif 'pattern' in tool_input:
+                                    lines.append(f"[dim]  🔍 {tool_input['pattern']}[/dim]")
+
+                        message_count += 1
+
+            except json.JSONDecodeError:
+                continue
+
+        if lines:
+            return '\n'.join(lines)
+
+    # Fallback: parse JSONL file directly
     if transcript_path:
         path = Path(transcript_path)
         if path.exists():
-            try:
-                with open(path, 'r') as f:
-                    count = 0
-                    for line in f:
-                        if count >= 10:
-                            break
-                        try:
-                            entry = json.loads(line)
-                            if entry.get('type') == 'human':
-                                message = entry.get('message', {})
-                                if isinstance(message, dict):
-                                    content = message.get('content', [])
-                                    if isinstance(content, list):
-                                        for item in content:
-                                            if isinstance(item, dict) and item.get('type') == 'text':
-                                                text = item.get('text', '')[:100].replace('\n', ' ')
-                                                lines.append(f"👤 {text}...")
-                                                count += 1
-                                                break
-                            elif entry.get('type') == 'assistant':
-                                message = entry.get('message', {})
-                                if isinstance(message, dict):
-                                    content = message.get('content', [])
-                                    if isinstance(content, list):
-                                        for item in content:
-                                            if isinstance(item, dict):
-                                                if item.get('type') == 'text':
-                                                    text = item.get('text', '')[:100].replace('\n', ' ')
-                                                    lines.append(f"🤖 {text}...")
-                                                    count += 1
-                                                    break
-                                                elif item.get('type') == 'tool_use':
-                                                    tool_name = item.get('name', 'Unknown')
-                                                    lines.append(f"⚡ Tool: {tool_name}")
-                                                    count += 1
-                                                    break
-                        except json.JSONDecodeError:
-                            continue
-            except Exception:
-                pass
+            return _parse_jsonl_for_preview(path, max_messages)
 
-    if not lines:
-        # Fallback to database events
-        events = get_session_events(session_id, limit=10)
+    # Last fallback: database events
+    events = get_session_events(session_id, limit=max_messages)
+    if events:
         for event in events:
             if event.get('event_type') == 'UserPromptSubmit' and event.get('prompt'):
-                text = event['prompt'][:100].replace('\n', ' ')
-                lines.append(f"👤 {text}...")
+                lines.append("")
+                lines.append("[bold cyan]━━━ 👤 User ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+                text = event['prompt'][:300]
+                lines.append(text + ("..." if len(event['prompt']) > 300 else ""))
             elif event.get('tool_name'):
-                lines.append(f"⚡ Tool: {event['tool_name']}")
+                lines.append(f"[bold yellow]⚡ {event['tool_name']}[/bold yellow]")
 
-    return '\n'.join(lines) if lines else "No preview available"
+    return '\n'.join(lines) if lines else "[dim]No preview available - try running 'claude-vault sync'[/dim]"
+
+
+def _parse_jsonl_for_preview(path: Path, max_messages: int) -> str:
+    """Parse JSONL file for preview."""
+    lines = []
+    message_count = 0
+
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                if message_count >= max_messages:
+                    break
+                try:
+                    entry = json.loads(line)
+                    entry_type = entry.get('type')
+
+                    if entry_type in ('human', 'user'):
+                        message = entry.get('message', {})
+                        content = message.get('content', '')
+                        if isinstance(content, list):
+                            content = ' '.join(
+                                item.get('text', '') for item in content
+                                if isinstance(item, dict) and item.get('type') == 'text'
+                            )
+                        if content:
+                            lines.append("")
+                            lines.append("[bold cyan]━━━ 👤 User ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+                            lines.append(content[:500] + ("..." if len(content) > 500 else ""))
+                            message_count += 1
+
+                    elif entry_type == 'assistant':
+                        message = entry.get('message', {})
+                        content_blocks = message.get('content', [])
+                        text_parts = []
+                        tool_uses = []
+
+                        for block in content_blocks:
+                            if isinstance(block, dict):
+                                if block.get('type') == 'text':
+                                    text_parts.append(block.get('text', ''))
+                                elif block.get('type') == 'tool_use':
+                                    tool_uses.append(block.get('name', 'Unknown'))
+
+                        if text_parts or tool_uses:
+                            lines.append("")
+                            lines.append("[bold green]━━━ 🤖 Assistant ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold green]")
+                            if text_parts:
+                                text = ' '.join(text_parts)[:500]
+                                lines.append(text + ("..." if len(' '.join(text_parts)) > 500 else ""))
+                            for tool in tool_uses:
+                                lines.append(f"[bold yellow]⚡ {tool}[/bold yellow]")
+                            message_count += 1
+
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+
+    return '\n'.join(lines) if lines else "[dim]Could not parse transcript[/dim]"
 
 
 def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
@@ -297,7 +410,7 @@ class RenameScreen(ModalScreen):
 
 
 class PreviewScreen(ModalScreen):
-    """Modal screen for previewing a session."""
+    """Modal screen for previewing a session with conversation format."""
 
     CSS = """
     PreviewScreen {
@@ -305,8 +418,8 @@ class PreviewScreen(ModalScreen):
     }
 
     #preview-dialog {
-        width: 80%;
-        height: 80%;
+        width: 90%;
+        height: 90%;
         border: solid #0078d4;
         background: #1e1e1e;
         padding: 1;
@@ -317,19 +430,24 @@ class PreviewScreen(ModalScreen):
         text-style: bold;
         height: 1;
         margin-bottom: 1;
+        color: #58a6ff;
+    }
+
+    #preview-scroll {
+        height: 1fr;
+        background: #0d1117;
+        border: solid #30363d;
     }
 
     #preview-content {
-        height: 1fr;
-        overflow-y: auto;
-        padding: 1;
-        background: #2d2d2d;
+        padding: 1 2;
     }
 
     #preview-footer {
         height: 1;
         text-align: center;
         color: #888;
+        margin-top: 1;
     }
     """
 
@@ -338,16 +456,28 @@ class PreviewScreen(ModalScreen):
         self.session = session
 
     def compose(self) -> ComposeResult:
-        preview = get_session_preview(self.session['session_id'], self.session.get('transcript_path'))
+        preview = get_session_preview(
+            self.session['session_id'],
+            self.session.get('transcript_path'),
+            max_messages=50  # Show more messages in full preview
+        )
+
+        title = self.session.get('custom_name') or self.session.get('title', 'Session')
+        if len(title) > 60:
+            title = title[:60] + "..."
+
         yield Container(
-            Static(f"Preview: {self.session['title'][:50]}...", id="preview-title"),
-            Static(preview, id="preview-content"),
-            Static("Press Esc or Enter to close", id="preview-footer"),
+            Static(f"📋 {title}", id="preview-title"),
+            VerticalScroll(
+                Static(preview, id="preview-content", markup=True),
+                id="preview-scroll"
+            ),
+            Static("↑↓ Scroll · Esc/Enter Close", id="preview-footer"),
             id="preview-dialog"
         )
 
     def on_key(self, event) -> None:
-        if event.key in ("escape", "enter"):
+        if event.key in ("escape", "enter", "q"):
             self.dismiss()
 
 
