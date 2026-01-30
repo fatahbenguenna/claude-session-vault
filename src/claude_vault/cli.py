@@ -1315,7 +1315,7 @@ def browse(ctx, project: Optional[str]):
                     console.print("")
                     console.print("[dim]Session content is preserved in the database.[/dim]")
                     console.print("[dim]Use 'claude-vault show' or browse preview to view it.[/dim]")
-                    continue
+                    return
 
                 # Change to project directory if found
                 if project_dir and Path(project_dir).exists():
