@@ -309,13 +309,17 @@ def list_sessions(
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
-    # Use transcript_entries for last_activity (more reliable after sync)
-    # Fall back to events or started_at if no transcript data
+    # Use the MOST RECENT timestamp from any source (transcript, events, or started_at)
+    # MAX() picks the lexicographically largest timestamp across all sources
     sql = """
         SELECT
             s.*,
             COUNT(t.id) as message_count,
-            COALESCE(MAX(t.timestamp), MAX(e.timestamp), s.started_at) as last_activity
+            MAX(
+                COALESCE(MAX(t.timestamp), ''),
+                COALESCE(MAX(e.timestamp), ''),
+                COALESCE(s.started_at, '')
+            ) as last_activity
         FROM sessions s
         LEFT JOIN transcript_entries t ON s.session_id = t.session_id
         LEFT JOIN events e ON s.session_id = e.session_id
