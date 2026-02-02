@@ -508,7 +508,6 @@ class PreviewScreen(ModalScreen):
         Binding("ctrl+f", "toggle_search", "Find", show=False),
         Binding("f3", "find_next", "Next", show=False),
         Binding("shift+f3", "find_prev", "Prev", show=False),
-        Binding("m", "load_more", "Load more", show=False),
     ]
 
     CSS = """
@@ -603,15 +602,14 @@ class PreviewScreen(ModalScreen):
         self.current_match_index = 0
         self.raw_preview = ""  # Store raw preview content
         self.preview_lines: List[str] = []  # Lines for search
-        self.loaded_count = 0  # Number of messages loaded
         self.total_entries = 0  # Total entries available
-        self.page_size = 50  # Messages per page
 
     def compose(self) -> ComposeResult:
-        self.raw_preview, self.total_entries, self.loaded_count = get_session_preview(
+        # Load ALL messages (no pagination - better UX for scrolling)
+        self.raw_preview, self.total_entries, _ = get_session_preview(
             self.session['session_id'],
             self.session.get('transcript_path'),
-            max_messages=self.page_size,
+            max_messages=10000,  # Load all
             offset=0
         )
         self.preview_lines = self.raw_preview.split('\n')
@@ -619,13 +617,6 @@ class PreviewScreen(ModalScreen):
         title = self.session.get('custom_name') or self.session.get('title', 'Session')
         if len(title) > 60:
             title = title[:60] + "..."
-
-        # Build footer with load more info
-        remaining = self.total_entries - self.loaded_count
-        if remaining > 0:
-            footer_text = f"↑↓:Scroll · m:Load more ({remaining}) · Ctrl+F:Find · e:Export · o:Open · Esc:Close"
-        else:
-            footer_text = "↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close"
 
         yield Container(
             Static(f"📋 {title}", id="preview-title"),
@@ -640,8 +631,8 @@ class PreviewScreen(ModalScreen):
                 Static(self.raw_preview, id="preview-content", markup=True),
                 id="preview-scroll"
             ),
-            Static(f"[dim]{self.loaded_count} of {self.total_entries} entries[/dim]" if self.total_entries > 0 else "", id="preview-status"),
-            Static(footer_text, id="preview-footer"),
+            Static(f"[dim]{self.total_entries} entries[/dim]" if self.total_entries > 0 else "", id="preview-status"),
+            Static("↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close", id="preview-footer"),
             id="preview-dialog"
         )
 
@@ -699,45 +690,6 @@ class PreviewScreen(ModalScreen):
     def action_close(self) -> None:
         """Close the preview and return to session list."""
         self.dismiss()
-
-    def action_load_more(self) -> None:
-        """Load more messages into the preview."""
-        remaining = self.total_entries - self.loaded_count
-        if remaining <= 0:
-            return
-
-        # Load next page
-        new_preview, _, new_loaded = get_session_preview(
-            self.session['session_id'],
-            self.session.get('transcript_path'),
-            max_messages=self.page_size,
-            offset=self.loaded_count
-        )
-
-        if new_preview and not new_preview.startswith("[dim]No conversation"):
-            # Append new content
-            self.raw_preview += "\n" + new_preview
-            self.loaded_count = new_loaded
-            self.preview_lines = self.raw_preview.split('\n')
-
-            # Update display
-            preview_content = self.query_one("#preview-content", Static)
-            preview_content.update(self.raw_preview)
-
-            # Update status and footer
-            remaining = self.total_entries - self.loaded_count
-            status = self.query_one("#preview-status", Static)
-            status.update(f"[dim]{self.loaded_count} of {self.total_entries} entries[/dim]")
-
-            footer = self.query_one("#preview-footer", Static)
-            if remaining > 0:
-                footer.update(f"↑↓:Scroll · m:Load more ({remaining}) · Ctrl+F:Find · e:Export · o:Open · Esc:Close")
-            else:
-                footer.update("↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close")
-
-            # Scroll to show new content
-            scroll = self.query_one("#preview-scroll", VerticalScroll)
-            scroll.scroll_end(animate=True)
 
     @on(Input.Changed, "#preview-search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
