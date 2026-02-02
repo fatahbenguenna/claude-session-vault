@@ -358,15 +358,19 @@ def get_orphaned_sessions(limit: int = 200) -> List[Dict[str, Any]]:
     fs_session_ids = set()
     if claude_projects.exists():
         for jsonl_file in claude_projects.rglob("*.jsonl"):
-            fs_session_ids.add(jsonl_file.stem)
+            session_id = jsonl_file.stem
+            # Skip subagent sessions
+            if '/subagents/' in str(jsonl_file) or '\\subagents\\' in str(jsonl_file) or session_id.startswith('agent-'):
+                continue
+            fs_session_ids.add(session_id)
 
-    # 2. Get all session IDs from database
+    # 2. Get all session IDs from database (excluding subagent sessions)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT DISTINCT session_id FROM sessions
+        SELECT DISTINCT session_id FROM sessions WHERE session_id NOT LIKE 'agent-%'
         UNION
-        SELECT DISTINCT session_id FROM transcript_entries
+        SELECT DISTINCT session_id FROM transcript_entries WHERE session_id NOT LIKE 'agent-%'
     """)
     db_session_ids = set(row[0] for row in cursor.fetchall())
 
@@ -1413,7 +1417,7 @@ class SessionBrowser(App):
     def _update_footer(self) -> None:
         """Update footer text based on current mode."""
         footer = self.query_one("#footer", Static)
-        toggle_label = "^O:all" if self.orphans_only else "^O:orphans"
+        toggle_label = "^O:non-orphans" if self.orphans_only else "^O:orphans"
         footer.update(f"↑↓:nav · ←→:fold · ^A:fold all · {toggle_label} · Enter:select · ^V:preview · ^E:export")
 
     def _is_navigable_node(self, node) -> bool:

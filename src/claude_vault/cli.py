@@ -1008,21 +1008,26 @@ def check(fix: bool, verbose: bool):
     console.print("[cyan]Scanning Claude projects directory...[/cyan]")
     jsonl_files = list(claude_projects.rglob("*.jsonl"))
     fs_sessions = {}  # session_id -> file_path
+    subagent_count = 0
 
     for jsonl_file in jsonl_files:
         session_id = jsonl_file.stem
+        # Skip subagent sessions - they don't trigger hooks
+        if '/subagents/' in str(jsonl_file) or '\\subagents\\' in str(jsonl_file) or session_id.startswith('agent-'):
+            subagent_count += 1
+            continue
         fs_sessions[session_id] = str(jsonl_file)
 
-    console.print(f"[dim]Found {len(fs_sessions)} JSONL files in filesystem[/dim]")
+    console.print(f"[dim]Found {len(fs_sessions)} JSONL files in filesystem (excluded {subagent_count} subagent sessions)[/dim]")
 
-    # 2. Get all sessions from database
+    # 2. Get all sessions from database (excluding subagent sessions)
     cursor.execute("""
-        SELECT DISTINCT session_id FROM sessions
+        SELECT DISTINCT session_id FROM sessions WHERE session_id NOT LIKE 'agent-%'
         UNION
-        SELECT DISTINCT session_id FROM transcript_entries
+        SELECT DISTINCT session_id FROM transcript_entries WHERE session_id NOT LIKE 'agent-%'
     """)
     db_sessions = set(row[0] for row in cursor.fetchall())
-    console.print(f"[dim]Found {len(db_sessions)} sessions in database[/dim]")
+    console.print(f"[dim]Found {len(db_sessions)} sessions in database (excluding subagents)[/dim]")
 
     # 3. Calculate discrepancies
     fs_session_ids = set(fs_sessions.keys())
