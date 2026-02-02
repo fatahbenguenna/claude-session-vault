@@ -1117,6 +1117,134 @@ def sync(session: Optional[str], sync_all: bool, force: bool):
 
 
 @main.command()
+@click.option("--dry-run", is_flag=True, help="Show what would be done without making changes")
+def optimize(dry_run: bool):
+    """Compress raw_json data and optimize the vault database.
+
+    \b
+    This command:
+    1. Compresses uncompressed raw_json data using zlib
+    2. Runs VACUUM to reclaim disk space
+    3. Shows before/after database size
+
+    \b
+    The compression is lossless and reduces database size by ~40%.
+    FTS5 full-text search is not affected (indexes the 'content' column).
+
+    \b
+    Examples:
+        claude-vault optimize            # Compress and vacuum
+        claude-vault optimize --dry-run  # Show what would be done
+    """
+    from claude_vault.db import get_db_path, get_raw_json_stats, compress_existing_raw_json, get_connection
+
+    db_path = get_db_path()
+
+    if not db_path.exists():
+        console.print("[yellow]Database not found. Run some sessions first.[/yellow]")
+        return
+
+    # Get current database size
+    original_db_size = db_path.stat().st_size
+
+    # Get raw_json stats
+    console.print("[cyan]Analyzing database...[/cyan]")
+    stats = get_raw_json_stats()
+
+    total = stats['total_rows']
+    compressed = stats['compressed_rows']
+    uncompressed = stats['uncompressed_rows']
+    current_size = stats['total_size_bytes']
+
+    console.print("")
+    console.print(f"[bold]Current State:[/bold]")
+    console.print(f"  Database size:     [cyan]{original_db_size / (1024*1024):.1f} MB[/cyan]")
+    console.print(f"  raw_json entries:  [cyan]{total:,}[/cyan]")
+    console.print(f"  Already compressed:[green]{compressed:,}[/green]")
+    console.print(f"  Uncompressed:      [yellow]{uncompressed:,}[/yellow]")
+    console.print(f"  raw_json size:     [cyan]{current_size / (1024*1024):.1f} MB[/cyan]")
+
+    if uncompressed == 0:
+        console.print("")
+        console.print("[green]✅ All raw_json data is already compressed![/green]")
+
+        if not dry_run:
+            # Run VACUUM anyway to reclaim space
+            console.print("")
+            console.print("[cyan]Running VACUUM to optimize database...[/cyan]")
+            conn = get_connection()
+            conn.execute("VACUUM")
+            conn.close()
+
+            new_db_size = db_path.stat().st_size
+            saved = original_db_size - new_db_size
+
+            if saved > 0:
+                console.print(f"[green]✅ Reclaimed {saved / (1024*1024):.1f} MB[/green]")
+                console.print(f"  New database size: [cyan]{new_db_size / (1024*1024):.1f} MB[/cyan]")
+            else:
+                console.print("[dim]No additional space to reclaim[/dim]")
+        return
+
+    # Estimate compression savings (typical ratio ~60-70%)
+    estimated_compressed_size = int(current_size * 0.35)  # ~65% compression
+    estimated_savings = current_size - estimated_compressed_size
+
+    console.print("")
+    console.print(f"[bold]Estimated after compression:[/bold]")
+    console.print(f"  raw_json size:     ~[green]{estimated_compressed_size / (1024*1024):.1f} MB[/green]")
+    console.print(f"  Space savings:     ~[green]{estimated_savings / (1024*1024):.1f} MB[/green]")
+
+    if dry_run:
+        console.print("")
+        console.print("[yellow]Dry run - no changes made[/yellow]")
+        console.print("[dim]Run without --dry-run to compress data[/dim]")
+        return
+
+    # Perform compression
+    console.print("")
+    console.print("[cyan]Compressing raw_json data...[/cyan]")
+
+    def progress_callback(processed, total):
+        pct = int(processed / total * 100)
+        console.print(f"  [dim]Progress: {pct}% ({processed:,}/{total:,})[/dim]", end='\r')
+
+    with console.status("[bold green]Compressing...") as status:
+        result = compress_existing_raw_json(progress_callback=progress_callback)
+
+    console.print("")  # Clear progress line
+
+    rows_compressed = result['rows_compressed']
+    original = result['original_size']
+    compressed_bytes = result['compressed_size']
+    actual_savings = original - compressed_bytes
+
+    console.print(f"[green]✅ Compressed {rows_compressed:,} entries[/green]")
+    console.print(f"  Original:   {original / (1024*1024):.1f} MB")
+    console.print(f"  Compressed: {compressed_bytes / (1024*1024):.1f} MB")
+    console.print(f"  Saved:      [green]{actual_savings / (1024*1024):.1f} MB[/green] ({int(actual_savings/original*100) if original > 0 else 0}%)")
+
+    # Run VACUUM
+    console.print("")
+    console.print("[cyan]Running VACUUM to reclaim disk space...[/cyan]")
+
+    conn = get_connection()
+    conn.execute("VACUUM")
+    conn.close()
+
+    new_db_size = db_path.stat().st_size
+    total_saved = original_db_size - new_db_size
+
+    console.print("")
+    console.print("[bold green]═══════════════════════════════════════════════════════[/bold green]")
+    console.print(f"[bold]Optimization Complete![/bold]")
+    console.print(f"  Before:  [dim]{original_db_size / (1024*1024):.1f} MB[/dim]")
+    console.print(f"  After:   [green]{new_db_size / (1024*1024):.1f} MB[/green]")
+    console.print(f"  Saved:   [bold green]{total_saved / (1024*1024):.1f} MB ({int(total_saved/original_db_size*100)}%)[/bold green]")
+    console.print("[bold green]═══════════════════════════════════════════════════════[/bold green]")
+
+
+@main.command()
 def update():
     """Update claude-session-vault to the latest version from GitHub."""
     import subprocess
