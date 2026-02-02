@@ -794,20 +794,38 @@ def sync(session: Optional[str], sync_all: bool, force: bool):
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Handle --force: delete all existing transcript entries
+    # Handle --force: delete existing transcript entries (but preserve orphaned sessions)
     if force:
-        cursor.execute("SELECT COUNT(*) FROM transcript_entries")
-        count = cursor.fetchone()[0]
-        if count > 0:
-            console.print(f"[yellow]Deleting {count} existing transcript entries...[/yellow]")
-            cursor.execute("DELETE FROM transcript_entries")
-            # Also rebuild FTS index
-            try:
-                cursor.execute("DELETE FROM transcript_fts")
-            except:
-                pass
-            conn.commit()
-            console.print("[green]✓ Cleared existing data[/green]")
+        # First, identify orphaned sessions (files deleted by Claude)
+        claude_projects = Path.home() / ".claude" / "projects"
+        fs_session_ids = set()
+        if claude_projects.exists():
+            for jsonl_file in claude_projects.rglob("*.jsonl"):
+                fs_session_ids.add(jsonl_file.stem)
+
+        cursor.execute("SELECT DISTINCT session_id FROM transcript_entries")
+        db_session_ids = set(row[0] for row in cursor.fetchall())
+        orphaned_ids = db_session_ids - fs_session_ids
+
+        if orphaned_ids:
+            console.print(f"[cyan]Preserving {len(orphaned_ids)} orphaned sessions (files deleted by Claude)[/cyan]")
+
+        # Only delete entries for sessions that CAN be re-synced (have files)
+        resyncable_ids = db_session_ids & fs_session_ids
+        if resyncable_ids:
+            placeholders = ','.join('?' * len(resyncable_ids))
+            cursor.execute(f"SELECT COUNT(*) FROM transcript_entries WHERE session_id IN ({placeholders})", list(resyncable_ids))
+            count = cursor.fetchone()[0]
+            if count > 0:
+                console.print(f"[yellow]Deleting {count} entries from {len(resyncable_ids)} re-syncable sessions...[/yellow]")
+                cursor.execute(f"DELETE FROM transcript_entries WHERE session_id IN ({placeholders})", list(resyncable_ids))
+                # Rebuild FTS index for deleted entries
+                try:
+                    cursor.execute(f"DELETE FROM transcript_fts WHERE session_id IN ({placeholders})", list(resyncable_ids))
+                except:
+                    pass
+                conn.commit()
+                console.print("[green]✓ Cleared re-syncable data (orphans preserved)[/green]")
 
     synced_total = 0
     sessions_synced = 0
