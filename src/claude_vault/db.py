@@ -2,11 +2,58 @@
 
 import sqlite3
 import json
+import zlib
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 DEFAULT_DB_PATH = Path.home() / ".claude" / "vault.db"
+
+
+# =============================================================================
+# Compression utilities for raw_json
+# =============================================================================
+
+def compress_json(raw_json: str) -> bytes:
+    """Compress a JSON string using zlib.
+
+    Args:
+        raw_json: The JSON string to compress
+
+    Returns:
+        Compressed bytes
+    """
+    return zlib.compress(raw_json.encode('utf-8'), level=6)
+
+
+def decompress_json(data: Union[bytes, str, None]) -> str:
+    """Decompress raw_json data, handling both compressed and uncompressed formats.
+
+    Args:
+        data: Either compressed bytes, uncompressed JSON string, or None
+
+    Returns:
+        Decompressed JSON string, or empty string if None
+    """
+    if data is None:
+        return ''
+
+    # If it's already a string, return as-is (uncompressed legacy data)
+    if isinstance(data, str):
+        return data
+
+    # If it's bytes, try to decompress
+    if isinstance(data, bytes):
+        try:
+            return zlib.decompress(data).decode('utf-8')
+        except zlib.error:
+            # Not compressed, try to decode as UTF-8
+            try:
+                return data.decode('utf-8')
+            except UnicodeDecodeError:
+                return ''
+
+    return ''
 
 
 def get_db_path() -> Path:
@@ -583,7 +630,8 @@ def sync_transcript_entries(
                 # Get timestamp
                 timestamp = entry.get('timestamp')
 
-                # Insert entry
+                # Insert entry with compressed raw_json
+                compressed_json = compress_json(line)
                 cursor.execute("""
                     INSERT OR IGNORE INTO transcript_entries
                     (session_id, line_number, entry_type, role, content, raw_json, timestamp)
@@ -594,7 +642,7 @@ def sync_transcript_entries(
                     entry_type,
                     role,
                     content,
-                    line,  # Store raw JSON for full reconstruction
+                    compressed_json,  # Compressed raw JSON
                     timestamp
                 ))
 
@@ -612,7 +660,10 @@ def get_transcript_entries(
     session_id: str,
     db_path: Optional[Path] = None
 ) -> List[Dict[str, Any]]:
-    """Get all transcript entries for a session from the database."""
+    """Get all transcript entries for a session from the database.
+
+    Automatically decompresses raw_json if it was stored compressed.
+    """
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
@@ -622,7 +673,14 @@ def get_transcript_entries(
         ORDER BY line_number ASC
     """, (session_id,))
 
-    results = [dict(row) for row in cursor.fetchall()]
+    results = []
+    for row in cursor.fetchall():
+        entry = dict(row)
+        # Decompress raw_json if needed
+        if entry.get('raw_json'):
+            entry['raw_json'] = decompress_json(entry['raw_json'])
+        results.append(entry)
+
     conn.close()
 
     return results
@@ -788,6 +846,137 @@ def search_sessions_with_content(
 
     conn.close()
     return results
+
+
+def compress_existing_raw_json(
+    db_path: Optional[Path] = None,
+    batch_size: int = 1000,
+    progress_callback=None
+) -> Dict[str, Any]:
+    """Compress existing uncompressed raw_json data in the database.
+
+    Args:
+        db_path: Optional database path
+        batch_size: Number of rows to process in each batch
+        progress_callback: Optional callback(processed, total) for progress updates
+
+    Returns:
+        Dict with stats: original_size, compressed_size, rows_compressed
+    """
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    # Count total rows that might need compression
+    cursor.execute("SELECT COUNT(*) FROM transcript_entries WHERE raw_json IS NOT NULL")
+    total_rows = cursor.fetchone()[0]
+
+    if total_rows == 0:
+        conn.close()
+        return {'rows_compressed': 0, 'original_size': 0, 'compressed_size': 0}
+
+    # Process in batches to avoid memory issues
+    original_size = 0
+    compressed_size = 0
+    rows_compressed = 0
+    offset = 0
+
+    while True:
+        # Fetch a batch of rows
+        cursor.execute("""
+            SELECT id, raw_json FROM transcript_entries
+            WHERE raw_json IS NOT NULL
+            ORDER BY id
+            LIMIT ? OFFSET ?
+        """, (batch_size, offset))
+
+        rows = cursor.fetchall()
+        if not rows:
+            break
+
+        updates = []
+        for row in rows:
+            row_id = row[0]
+            raw_json = row[1]
+
+            # Skip if already compressed (bytes)
+            if isinstance(raw_json, bytes):
+                continue
+
+            # It's uncompressed string - compress it
+            if isinstance(raw_json, str):
+                original_size += len(raw_json.encode('utf-8'))
+                compressed = compress_json(raw_json)
+                compressed_size += len(compressed)
+                updates.append((compressed, row_id))
+                rows_compressed += 1
+
+        # Apply batch updates
+        if updates:
+            cursor.executemany(
+                "UPDATE transcript_entries SET raw_json = ? WHERE id = ?",
+                updates
+            )
+            conn.commit()
+
+        offset += batch_size
+
+        # Report progress
+        if progress_callback:
+            progress_callback(min(offset, total_rows), total_rows)
+
+    conn.close()
+
+    return {
+        'rows_compressed': rows_compressed,
+        'original_size': original_size,
+        'compressed_size': compressed_size
+    }
+
+
+def get_raw_json_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Get statistics about raw_json storage (compressed vs uncompressed).
+
+    Returns:
+        Dict with: total_rows, compressed_rows, uncompressed_rows, total_size_bytes
+    """
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM transcript_entries WHERE raw_json IS NOT NULL")
+    total_rows = cursor.fetchone()[0]
+
+    if total_rows == 0:
+        conn.close()
+        return {
+            'total_rows': 0,
+            'compressed_rows': 0,
+            'uncompressed_rows': 0,
+            'total_size_bytes': 0
+        }
+
+    # Sample to detect compression ratio
+    compressed_count = 0
+    uncompressed_count = 0
+    total_size = 0
+
+    cursor.execute("SELECT raw_json FROM transcript_entries WHERE raw_json IS NOT NULL")
+    for row in cursor.fetchall():
+        raw_json = row[0]
+        if isinstance(raw_json, bytes):
+            compressed_count += 1
+            total_size += len(raw_json)
+        elif isinstance(raw_json, str):
+            uncompressed_count += 1
+            total_size += len(raw_json.encode('utf-8'))
+
+    conn.close()
+
+    return {
+        'total_rows': total_rows,
+        'compressed_rows': compressed_count,
+        'uncompressed_rows': uncompressed_count,
+        'total_size_bytes': total_size
+    }
 
 
 def search_sessions_by_content(
