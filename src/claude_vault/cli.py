@@ -1051,7 +1051,21 @@ def check(fix: bool, verbose: bool):
     fs_session_ids = set(fs_sessions.keys())
 
     missing_in_db = fs_session_ids - db_sessions  # In filesystem, not in DB
-    orphaned_in_db = db_sessions - fs_session_ids  # In DB, not in filesystem
+    orphaned_in_db_raw = db_sessions - fs_session_ids  # In DB, not in filesystem
+
+    # Filter orphaned sessions: only those with actual transcript content are recoverable
+    orphaned_with_content = set()
+    orphaned_empty = set()
+    for session_id in orphaned_in_db_raw:
+        cursor.execute(
+            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ? AND entry_type IN ('user', 'human', 'assistant')",
+            (session_id,)
+        )
+        count = cursor.fetchone()[0]
+        if count > 0:
+            orphaned_with_content.add(session_id)
+        else:
+            orphaned_empty.add(session_id)
 
     # 4. Check for entry count mismatches
     out_of_sync = []
@@ -1085,7 +1099,7 @@ def check(fix: bool, verbose: bool):
     # 5. Display results
     console.print("")
 
-    if not missing_in_db and not orphaned_in_db and not out_of_sync:
+    if not missing_in_db and not orphaned_with_content and not orphaned_empty and not out_of_sync:
         console.print("[green]✅ No discrepancies found! Database is in sync with filesystem.[/green]")
         return
 
@@ -1107,20 +1121,38 @@ def check(fix: bool, verbose: bool):
             console.print(table)
         console.print("")
 
-    # Orphaned sessions (in DB, not in filesystem)
-    if orphaned_in_db:
+    # Orphaned sessions with content (recoverable via --orphans)
+    if orphaned_with_content:
         console.print(Panel(
-            f"[red]{len(orphaned_in_db)}[/red] sessions exist in database but file was deleted",
-            title="[bold red]Orphaned in Database[/bold red]",
-            border_style="red"
+            f"[green]{len(orphaned_with_content)}[/green] sessions recoverable (file deleted but content preserved in vault)",
+            title="[bold green]Orphaned - Recoverable[/bold green]",
+            border_style="green"
         ))
         if verbose:
             table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
             table.add_column("Session ID", style="cyan")
-            for session_id in sorted(list(orphaned_in_db))[:20]:
+            for session_id in sorted(list(orphaned_with_content))[:20]:
                 table.add_row(session_id[:12] + "...")
-            if len(orphaned_in_db) > 20:
-                table.add_row(f"... and {len(orphaned_in_db) - 20} more")
+            if len(orphaned_with_content) > 20:
+                table.add_row(f"... and {len(orphaned_with_content) - 20} more")
+            console.print(table)
+        console.print("[dim]View with: claude-vault browse --orphans[/dim]")
+        console.print("")
+
+    # Orphaned sessions without content (empty shells, can be cleaned up)
+    if orphaned_empty:
+        console.print(Panel(
+            f"[dim]{len(orphaned_empty)}[/dim] empty sessions (file deleted, no content in vault)",
+            title="[dim]Orphaned - Empty[/dim]",
+            border_style="dim"
+        ))
+        if verbose:
+            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+            table.add_column("Session ID", style="dim")
+            for session_id in sorted(list(orphaned_empty))[:10]:
+                table.add_row(session_id[:12] + "...")
+            if len(orphaned_empty) > 10:
+                table.add_row(f"... and {len(orphaned_empty) - 10} more")
             console.print(table)
         console.print("")
 
@@ -1149,8 +1181,16 @@ def check(fix: bool, verbose: bool):
         console.print("")
 
     # Summary
-    total_issues = len(missing_in_db) + len(orphaned_in_db) + len(out_of_sync)
-    console.print(f"[bold]Summary:[/bold] {total_issues} total discrepancies found")
+    summary_parts = []
+    if missing_in_db:
+        summary_parts.append(f"{len(missing_in_db)} missing")
+    if orphaned_with_content:
+        summary_parts.append(f"{len(orphaned_with_content)} recoverable")
+    if orphaned_empty:
+        summary_parts.append(f"{len(orphaned_empty)} empty")
+    if out_of_sync:
+        summary_parts.append(f"{len(out_of_sync)} out of sync")
+    console.print(f"[bold]Summary:[/bold] {', '.join(summary_parts)}")
 
     # Fix option
     if fix and missing_in_db:
