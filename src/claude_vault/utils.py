@@ -1,5 +1,6 @@
 """Shared utility functions for Claude Session Vault."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,17 +62,23 @@ def extract_text_from_content(content: Any) -> str:
     return str(content)
 
 
-def parse_message_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def parse_message_entry(entry: Dict[str, Any], include_tool_details: bool = False) -> Optional[Dict[str, Any]]:
     """Parse a JSONL or DB transcript entry into a normalized message dict.
+
+    Args:
+        entry: The raw entry dict (from JSONL or DB raw_json)
+        include_tool_details: If True, include full tool input details; if False, just names
 
     Returns a dict with:
     - role: 'user' or 'assistant'
     - content: extracted text content
-    - tool_uses: list of tool names used (for assistant messages)
+    - tool_uses: list of tool info (names or full details)
+    - timestamp: the entry timestamp
 
     Returns None if the entry is not a user/assistant message.
     """
     entry_type = entry.get('type', '')
+    timestamp = entry.get('timestamp', '')
 
     if entry_type in ('user', 'human'):
         message = entry.get('message', {})
@@ -83,6 +90,7 @@ def parse_message_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 'role': 'user',
                 'content': text,
                 'tool_uses': [],
+                'timestamp': timestamp,
             }
 
     elif entry_type == 'assistant':
@@ -98,7 +106,13 @@ def parse_message_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     if block.get('type') == 'text':
                         text_parts.append(block.get('text', ''))
                     elif block.get('type') == 'tool_use':
-                        tool_uses.append(block.get('name', 'Unknown'))
+                        if include_tool_details:
+                            tool_uses.append({
+                                'name': block.get('name', 'unknown'),
+                                'input': block.get('input', {}),
+                            })
+                        else:
+                            tool_uses.append(block.get('name', 'Unknown'))
         elif isinstance(content_blocks, str):
             text_parts.append(content_blocks)
 
@@ -107,9 +121,41 @@ def parse_message_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 'role': 'assistant',
                 'content': '\n'.join(text_parts),
                 'tool_uses': tool_uses,
+                'timestamp': timestamp,
             }
 
     return None
+
+
+def parse_transcript_to_messages(entries: List[Dict[str, Any]], from_raw_json: bool = False) -> List[Dict[str, Any]]:
+    """Parse a list of transcript entries into conversation messages.
+
+    Args:
+        entries: List of entries (either raw JSONL dicts or DB entries with raw_json)
+        from_raw_json: If True, entries have raw_json field to parse; if False, entries are already dicts
+
+    Returns:
+        List of parsed message dicts with role, content, tool_uses, timestamp
+    """
+    messages = []
+
+    for entry in entries:
+        if from_raw_json:
+            raw_json = entry.get('raw_json')
+            if not raw_json:
+                continue
+            try:
+                data = json.loads(raw_json)
+            except json.JSONDecodeError:
+                continue
+        else:
+            data = entry
+
+        parsed = parse_message_entry(data, include_tool_details=True)
+        if parsed:
+            messages.append(parsed)
+
+    return messages
 
 
 def decode_project_path(encoded_name: str) -> str:

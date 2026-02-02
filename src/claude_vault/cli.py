@@ -29,6 +29,7 @@ from claude_vault.utils import (
     find_session_file,
     decode_project_path,
     parse_message_entry,
+    parse_transcript_to_messages,
 )
 
 console = Console()
@@ -415,130 +416,26 @@ def stats(as_json: bool):
 
 def parse_jsonl_transcript(transcript_path: str) -> list:
     """Parse a Claude Code JSONL transcript file into conversation format."""
-    messages = []
     transcript = Path(transcript_path)
-
     if not transcript.exists():
         return []
 
+    entries = []
     with open(transcript, 'r', encoding='utf-8') as f:
         for line in f:
             if not line.strip():
                 continue
             try:
-                entry = json.loads(line)
-                msg_type = entry.get('type')
-
-                if msg_type == 'user':
-                    # User message
-                    message = entry.get('message', {})
-                    content = message.get('content', '')
-                    if isinstance(content, list):
-                        # Extract text from content blocks
-                        content = '\n'.join(
-                            block.get('text', '') for block in content
-                            if isinstance(block, dict) and block.get('type') == 'text'
-                        )
-                    if content:
-                        messages.append({
-                            'role': 'user',
-                            'content': content,
-                            'timestamp': entry.get('timestamp', '')
-                        })
-
-                elif msg_type == 'assistant':
-                    # Assistant message
-                    message = entry.get('message', {})
-                    content_blocks = message.get('content', [])
-
-                    text_parts = []
-                    tool_uses = []
-
-                    for block in content_blocks:
-                        if isinstance(block, dict):
-                            if block.get('type') == 'text':
-                                text_parts.append(block.get('text', ''))
-                            elif block.get('type') == 'tool_use':
-                                tool_uses.append({
-                                    'name': block.get('name', 'unknown'),
-                                    'input': block.get('input', {})
-                                })
-
-                    if text_parts or tool_uses:
-                        messages.append({
-                            'role': 'assistant',
-                            'content': '\n'.join(text_parts),
-                            'tool_uses': tool_uses,
-                            'timestamp': entry.get('timestamp', '')
-                        })
-
-                elif msg_type == 'tool_result':
-                    # Tool result - we can skip these in export or include as collapsed
-                    pass
-
+                entries.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
 
-    return messages
+    return parse_transcript_to_messages(entries, from_raw_json=False)
 
 
 def parse_db_transcript_entries(entries: list) -> list:
     """Convert database transcript entries to conversation format using raw_json."""
-    messages = []
-
-    for entry in entries:
-        raw_json = entry.get('raw_json')
-        if not raw_json:
-            continue
-
-        try:
-            data = json.loads(raw_json)
-            msg_type = data.get('type')
-
-            if msg_type == 'user':
-                message = data.get('message', {})
-                content = message.get('content', '')
-                if isinstance(content, list):
-                    content = '\n'.join(
-                        block.get('text', '') for block in content
-                        if isinstance(block, dict) and block.get('type') == 'text'
-                    )
-                if content:
-                    messages.append({
-                        'role': 'user',
-                        'content': content,
-                        'timestamp': data.get('timestamp', '')
-                    })
-
-            elif msg_type == 'assistant':
-                message = data.get('message', {})
-                content_blocks = message.get('content', [])
-
-                text_parts = []
-                tool_uses = []
-
-                for block in content_blocks:
-                    if isinstance(block, dict):
-                        if block.get('type') == 'text':
-                            text_parts.append(block.get('text', ''))
-                        elif block.get('type') == 'tool_use':
-                            tool_uses.append({
-                                'name': block.get('name', 'unknown'),
-                                'input': block.get('input', {})
-                            })
-
-                if text_parts or tool_uses:
-                    messages.append({
-                        'role': 'assistant',
-                        'content': '\n'.join(text_parts),
-                        'tool_uses': tool_uses,
-                        'timestamp': data.get('timestamp', '')
-                    })
-
-        except json.JSONDecodeError:
-            continue
-
-    return messages
+    return parse_transcript_to_messages(entries, from_raw_json=True)
 
 
 @main.command()
@@ -693,15 +590,28 @@ def export(output_path: str, session: str, fmt: str):
 
     else:  # txt
         lines = []
-        for e in events:
-            lines.append(f"[{e.get('timestamp', '')}] {e.get('event_type', '')}")
-            if e.get('prompt'):
-                lines.append(f"  Prompt: {e['prompt'][:200]}")
-            if e.get('tool_name'):
-                lines.append(f"  Tool: {e['tool_name']}")
+        for msg in messages:
+            role = msg.get('role', 'unknown').upper()
+            timestamp = msg.get('timestamp', '')[:19] if msg.get('timestamp') else ''
+            lines.append(f"[{timestamp}] {role}")
+            content = msg.get('content', '')
+            if content:
+                # Indent content
+                for line in content[:500].split('\n'):
+                    lines.append(f"  {line}")
+                if len(content) > 500:
+                    lines.append("  ...")
+            tool_uses = msg.get('tool_uses', [])
+            if tool_uses:
+                for tool in tool_uses:
+                    if isinstance(tool, dict):
+                        lines.append(f"  Tool: {tool.get('name', 'unknown')}")
+                    else:
+                        lines.append(f"  Tool: {tool}")
+            lines.append("")  # Empty line between messages
         output.write_text('\n'.join(lines))
 
-    console.print(f"[green]Exported to {output_path}[/green]")
+    console.print(f"[green]Exported {len(messages)} messages to {output_path}[/green]")
 
 
 @main.command()
