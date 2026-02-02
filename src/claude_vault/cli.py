@@ -23,6 +23,12 @@ from claude_vault.db import (
     get_db_path,
     get_transcript_entries,
     sync_transcript_entries,
+    find_session_by_prefix,
+)
+from claude_vault.utils import (
+    find_session_file,
+    decode_project_path,
+    parse_message_entry,
 )
 
 console = Console()
@@ -1334,35 +1340,6 @@ def browse(ctx, project: Optional[str], orphans: bool):
                 session_id = session['session_id']
 
                 import os
-
-                def decode_project_path(encoded_name: str) -> str:
-                    """Decode Claude's encoded project path.
-
-                    Encoding: / -> -  and  _ -> - (with -- for /_)
-                    Simple decode: just replace - with / for paths without underscores.
-                    """
-                    if not encoded_name.startswith('-'):
-                        return encoded_name
-                    # Simple decode for common case (no underscores in path)
-                    return encoded_name.replace('-', '/')
-
-                def find_session_file(sid: str, tp: Optional[str] = None):
-                    """Find the JSONL file for a session. Returns (file_path, project_dir) or (None, None)."""
-                    # Strategy 1: Use transcript_path if provided and exists
-                    if tp and Path(tp).exists():
-                        parent_name = Path(tp).parent.name
-                        proj_dir = decode_project_path(parent_name)
-                        return tp, proj_dir
-
-                    # Strategy 2: Search in Claude's projects directory
-                    claude_projects = Path.home() / ".claude" / "projects"
-                    if claude_projects.exists():
-                        for jsonl_file in claude_projects.rglob(f"{sid}.jsonl"):
-                            parent_name = jsonl_file.parent.name
-                            proj_dir = decode_project_path(parent_name)
-                            return str(jsonl_file), proj_dir
-
-                    return None, None
 
                 # Find the session file
                 transcript_path = session.get('transcript_path')

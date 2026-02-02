@@ -40,37 +40,12 @@ from claude_vault.db import (
     search_sessions_by_content,
     search_sessions_with_content,
 )
-
-
-def relative_time(dt: datetime) -> str:
-    """Convert datetime to human-readable relative time."""
-    now = datetime.now()
-    # Handle timezone-aware datetimes by making dt naive
-    if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
-    diff = now - dt
-    seconds = diff.total_seconds()
-
-    if seconds < 0:
-        return "just now"
-    elif seconds < 60:
-        n = int(seconds)
-        return f"{n} second{'s' if n != 1 else ''} ago"
-    elif seconds < 3600:
-        n = int(seconds / 60)
-        return f"{n} minute{'s' if n != 1 else ''} ago"
-    elif seconds < 86400:
-        n = int(seconds / 3600)
-        return f"{n} hour{'s' if n != 1 else ''} ago"
-    elif seconds < 604800:
-        n = int(seconds / 86400)
-        return f"{n} day{'s' if n != 1 else ''} ago"
-    elif seconds < 2592000:
-        n = int(seconds / 604800)
-        return f"{n} week{'s' if n != 1 else ''} ago"
-    else:
-        n = int(seconds / 2592000)
-        return f"{n} month{'s' if n != 1 else ''} ago"
+from claude_vault.utils import (
+    relative_time,
+    parse_datetime_safe,
+    session_file_exists,
+    extract_text_from_content,
+)
 
 
 def _is_system_context(text: str) -> bool:
@@ -260,21 +235,6 @@ def get_session_preview(session_id: str, transcript_path: Optional[str] = None, 
     return '\n'.join(lines) if lines else "[dim]No conversation content in this session.\n\nThis session may only contain metadata (file snapshots, etc.)\nor the transcript was not synced yet.\n\nTry: claude-vault sync --all[/dim]"
 
 
-def session_file_exists(session_id: str, transcript_path: Optional[str] = None) -> bool:
-    """Check if the session's JSONL file still exists in Claude's projects directory."""
-    # Check transcript_path if provided
-    if transcript_path:
-        return Path(transcript_path).exists()
-
-    # Search in Claude's projects directory
-    claude_projects = Path.home() / ".claude" / "projects"
-    if claude_projects.exists():
-        for jsonl_file in claude_projects.rglob(f"{session_id}.jsonl"):
-            return True
-
-    return False
-
-
 def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
     """Get sessions with enriched data from database."""
     sessions = list_sessions(limit=limit)
@@ -306,21 +266,8 @@ def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
         row = cursor.fetchone()
         transcript_path = row[0] if row else None
 
-        # Parse last activity time (always use naive datetime for comparison)
-        last_activity = session.get('last_activity', '')
-        try:
-            if last_activity:
-                if 'T' in str(last_activity):
-                    dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
-                    # Convert to naive datetime for consistent comparison
-                    if dt.tzinfo is not None:
-                        dt = dt.replace(tzinfo=None)
-                else:
-                    dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
-            else:
-                dt = datetime.now()
-        except:
-            dt = datetime.now()
+        # Parse last activity time
+        dt = parse_datetime_safe(session.get('last_activity', ''))
 
         # Extract project name
         project_name = session.get('project_name') or session.get('project')
@@ -409,18 +356,7 @@ def get_orphaned_sessions(limit: int = 200) -> List[Dict[str, Any]]:
         last_activity = row[0] if row else None
 
         # Parse last activity time
-        try:
-            if last_activity:
-                if 'T' in str(last_activity):
-                    dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
-                    if dt.tzinfo is not None:
-                        dt = dt.replace(tzinfo=None)
-                else:
-                    dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
-            else:
-                dt = datetime.now()
-        except:
-            dt = datetime.now()
+        dt = parse_datetime_safe(last_activity)
 
         if not project_name:
             project_name = 'deleted'
@@ -1158,20 +1094,8 @@ class SessionBrowser(App):
 
                 for cr in content_results:
                     if cr['session_id'] not in existing_ids:
-                        # Parse last_activity to datetime (always naive for comparison)
-                        last_activity = cr['last_activity']
-                        try:
-                            if last_activity and 'T' in str(last_activity):
-                                dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
-                                # Convert to naive datetime for consistent comparison
-                                if dt.tzinfo is not None:
-                                    dt = dt.replace(tzinfo=None)
-                            elif last_activity:
-                                dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
-                            else:
-                                dt = datetime.now()
-                        except:
-                            dt = datetime.now()
+                        # Parse last_activity to datetime
+                        dt = parse_datetime_safe(cr['last_activity'])
 
                         # Create session entry for content match
                         content_sessions.append({

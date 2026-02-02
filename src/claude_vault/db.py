@@ -24,6 +24,61 @@ def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def db_cursor(db_path: Optional[Path] = None):
+    """Context manager for database operations.
+
+    Usage:
+        with db_cursor() as cursor:
+            cursor.execute("SELECT * FROM sessions")
+            results = cursor.fetchall()
+        # Connection is automatically closed and committed
+
+    Yields:
+        sqlite3.Cursor: A cursor for database operations.
+    """
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.cursor()
+        yield cursor
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def find_session_by_prefix(session_prefix: str, db_path: Optional[Path] = None) -> Optional[str]:
+    """Find a session ID by its prefix.
+
+    Args:
+        session_prefix: The prefix of the session ID (e.g., 'abc123')
+        db_path: Optional database path
+
+    Returns:
+        The full session ID if found, None otherwise.
+    """
+    with db_cursor(db_path) as cursor:
+        cursor.execute(
+            "SELECT session_id FROM sessions WHERE session_id LIKE ? LIMIT 1",
+            (f"{session_prefix}%",)
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+
+        # Also check transcript_entries table
+        cursor.execute(
+            "SELECT DISTINCT session_id FROM transcript_entries WHERE session_id LIKE ? LIMIT 1",
+            (f"{session_prefix}%",)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     """Initialize the database schema with FTS5 for full-text search."""
     conn = get_connection(db_path)
