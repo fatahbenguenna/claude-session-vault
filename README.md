@@ -91,6 +91,7 @@ claude-vault --orphans    # Browse only deleted sessions (recovered from vault)
 | ❌ No export | ✅ **Export to Markdown/JSON** |
 | ❌ No statistics | ✅ **Usage analytics** |
 | ❌ Closed format | ✅ **Open SQLite database** |
+| ❌ Large storage footprint | ✅ **Compressed storage** (~40% smaller) |
 
 ## Complete Workflow
 
@@ -101,15 +102,15 @@ claude-vault --orphans    # Browse only deleted sessions (recovered from vault)
 └─────────────────────────────────────────────────────────────────────────────┘
 
   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-  │   INSTALL    │────▶│     SYNC     │────▶│    CHECK     │────▶│  UNINSTALL   │
+  │   INSTALL    │────▶│     SYNC     │────▶│   OPTIMIZE   │────▶│    CHECK     │
   │              │     │              │     │              │     │              │
-  │ pipx install │     │ sync --all   │     │ check --fix  │     │  uninstall   │
+  │ pipx install │     │ sync --all   │     │   optimize   │     │ check --fix  │
   │ vault-install│     │              │     │              │     │              │
   └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
          │                    │                    │                    │
          ▼                    ▼                    ▼                    ▼
-   Install hooks        Import history      Detect & fix          Remove hooks
-   Create database      Enable search       discrepancies         Delete database
+   Install hooks        Import history       Compress DB         Detect & fix
+   Create database      Enable search        Save ~40%           discrepancies
 ```
 
 ### Step 1: Install
@@ -136,7 +137,19 @@ claude-vault stats
 
 This one-time sync imports your existing conversation history (can take a few minutes for large histories).
 
-### Step 3: Check (Maintenance)
+### Step 3: Optimize (Optional)
+
+```bash
+# Compress existing data and reclaim disk space
+claude-vault optimize
+
+# Preview without making changes
+claude-vault optimize --dry-run
+```
+
+Compresses the database using zlib, reducing size by ~40%. New sessions are automatically compressed.
+
+### Step 4: Check (Maintenance)
 
 ```bash
 # Detect discrepancies between Claude's files and vault database
@@ -154,7 +167,7 @@ Run periodically to ensure the vault stays in sync. Detects:
 - **Orphaned**: Sessions in vault but Claude deleted the file (normal)
 - **Out of sync**: Different entry counts (active sessions)
 
-### Step 4: Uninstall (Optional)
+### Step 5: Uninstall (Optional)
 
 ```bash
 # Complete removal (hooks + database)
@@ -263,11 +276,11 @@ claude-vault stats
 ╰──────────────────────────────────────────────────────────────────────────────╯
   Metric                              Value
  ───────────────────────────────────────────
-  Total Sessions                         39
-  Total Events                         1011
-  Transcript Entries                 149149
-  Sessions with Full Transcript       15510
-  Database Size                   795.01 MB
+  Total Sessions                      15798
+  Total Events                         1370
+  Transcript Entries                 187163
+  Sessions with Full Transcript       15721
+  Database Size                   603.67 MB  ← Compressed!
 
 Top Projects: fps-api (31), luxCaRent (2), claude-session-vault (1)
 Most Used Tools: Bash (417), Read (327), Edit (67)
@@ -300,6 +313,16 @@ claude-vault
 
 These "orphaned" sessions exist in your vault database but their original JSONL files were removed by Claude. You can still preview, search, and export them.
 
+### Optimize Database
+
+```bash
+# Compress existing data and reclaim disk space (~40% reduction)
+claude-vault optimize
+
+# Preview what would be done
+claude-vault optimize --dry-run
+```
+
 ### Other
 
 ```bash
@@ -321,6 +344,10 @@ Claude Session Vault uses Claude Code's [hooks system](https://docs.anthropic.co
 Additionally, `sync` command parses Claude's JSONL transcript files to extract full conversation content for search.
 
 All data is stored locally in `~/.claude/vault.db` (SQLite with FTS5).
+
+### Compression
+
+Transcript data is compressed using zlib, reducing database size by ~40%. This happens automatically for new sessions. Run `claude-vault optimize` to compress existing data.
 
 ## Database Schema
 
@@ -346,7 +373,8 @@ CREATE TABLE events (
 CREATE TABLE transcript_entries (
     session_id TEXT,
     role TEXT,
-    content TEXT,
+    content TEXT,      -- Indexed for full-text search
+    raw_json BLOB,     -- Compressed original JSON (zlib)
     timestamp TIMESTAMP
 );
 ```
@@ -368,6 +396,23 @@ pipx uninstall claude-session-vault
 
 - Python 3.10+
 - Claude Code CLI
+
+## Contributing
+
+Contributions are welcome! This project uses [Conventional Commits](https://www.conventionalcommits.org/) for automatic versioning:
+
+- `feat:` - New feature → minor version bump (1.0.0 → 1.1.0)
+- `fix:` - Bug fix → patch version bump (1.0.0 → 1.0.1)
+- `feat!:` or `BREAKING CHANGE:` - Breaking change → major version bump (1.0.0 → 2.0.0)
+
+Releases are created automatically when commits are merged to `main`.
+
+```bash
+# Clone and install for development
+git clone https://github.com/fatahbenguenna/claude-session-vault.git
+cd claude-session-vault
+pip install -e .
+```
 
 ## License
 
