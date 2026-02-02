@@ -20,6 +20,11 @@ claude-vault
 
 **`claude-vault` (or `claude-vault browse`)** is the heart of the application. It provides a TUI similar to `claude --resume` but with powerful search capabilities.
 
+```bash
+claude-vault              # Browse all sessions
+claude-vault --orphans    # Browse only deleted sessions (recovered from vault)
+```
+
 ```
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Browse Sessions (71)                                                         │
@@ -45,6 +50,7 @@ claude-vault
 | **Fuzzy Search** | Type to filter by project name or session title |
 | **Content Search** | Type 3+ characters to search inside conversation content |
 | **Full History** | Access all sessions even after Claude purges old ones |
+| **Recover Deleted** | Use `--orphans` to browse sessions Claude deleted |
 | **Preview** | Press `Ctrl+V` to preview session content |
 | **Open in Claude** | From preview, press `o` to resume session in Claude Code |
 | **Export** | Press `Ctrl+E` to export to Markdown |
@@ -58,6 +64,7 @@ claude-vault
 | `↑` `↓` | Navigate sessions |
 | `←` `→` | Collapse/expand project groups |
 | `Ctrl+A` | Toggle collapse/expand all groups |
+| `Ctrl+O` | Toggle orphaned sessions filter |
 | `Enter` | Select session |
 | `Ctrl+V` | Open preview |
 | `Ctrl+E` | Export to Markdown |
@@ -79,6 +86,7 @@ claude-vault
 |-------------------|----------------|
 | ✅ Resume sessions | ✅ Browse all history |
 | ❌ Sessions can be purged | ✅ **Permanent archive** |
+| ❌ Deleted sessions are lost | ✅ **Recover deleted sessions** (`--orphans`) |
 | ❌ Search by title only | ✅ **Full-text content search** |
 | ❌ No export | ✅ **Export to Markdown/JSON** |
 | ❌ No statistics | ✅ **Usage analytics** |
@@ -277,6 +285,20 @@ claude-vault check -v
 # Automatically sync missing sessions
 claude-vault check --fix
 ```
+
+### Browse Deleted Sessions
+
+Claude Code periodically cleans up old session files. With Claude Session Vault, you can still access them:
+
+```bash
+# Browse only sessions that Claude has deleted
+claude-vault browse --orphans
+
+# Or toggle orphan filter with Ctrl+O from the browser
+claude-vault
+```
+
+These "orphaned" sessions exist in your vault database but their original JSONL files were removed by Claude. You can still preview, search, and export them.
 
 ### Other
 

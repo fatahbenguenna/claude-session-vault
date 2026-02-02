@@ -7,9 +7,11 @@ Features like claude --resume:
 - Preview panel (Ctrl+V)
 - Rename session (Ctrl+R)
 - Arrow key navigation
+- In-preview search (Ctrl+F)
 """
 
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -17,12 +19,13 @@ from collections import defaultdict
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Input, Static, Tree, TextArea
+from textual.widgets import Input, Static, Tree, TextArea, LoadingIndicator
 from textual.widgets.tree import TreeNode
 from textual.containers import Container, Vertical, Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual import on
+from textual.worker import Worker, get_current_worker
+from textual import on, work
 from rich.text import Text
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -348,6 +351,95 @@ def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
     return enriched
 
 
+def get_orphaned_sessions(limit: int = 200) -> List[Dict[str, Any]]:
+    """Get sessions that exist in database but whose files were deleted by Claude."""
+    # 1. Scan filesystem for existing session IDs
+    claude_projects = Path.home() / ".claude" / "projects"
+    fs_session_ids = set()
+    if claude_projects.exists():
+        for jsonl_file in claude_projects.rglob("*.jsonl"):
+            fs_session_ids.add(jsonl_file.stem)
+
+    # 2. Get all session IDs from database
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT session_id FROM sessions
+        UNION
+        SELECT DISTINCT session_id FROM transcript_entries
+    """)
+    db_session_ids = set(row[0] for row in cursor.fetchall())
+
+    # 3. Find orphaned sessions (in DB but not in filesystem)
+    orphaned_ids = db_session_ids - fs_session_ids
+
+    # 4. Build enriched session data for orphaned sessions
+    orphaned = []
+    for session_id in orphaned_ids:
+        # Get message count
+        cursor.execute(
+            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ? AND entry_type IN ('user', 'human', 'assistant')",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        message_count = row[0] if row else 0
+
+        if message_count == 0:
+            continue
+
+        # Get session info
+        cursor.execute(
+            "SELECT project_name, custom_name FROM sessions WHERE session_id = ?",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        project_name = row[0] if row else 'unknown'
+        custom_name = row[1] if row else None
+
+        # Get last activity from transcript
+        cursor.execute(
+            "SELECT MAX(timestamp) FROM transcript_entries WHERE session_id = ?",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        last_activity = row[0] if row else None
+
+        # Parse last activity time
+        try:
+            if last_activity:
+                if 'T' in str(last_activity):
+                    dt = datetime.fromisoformat(str(last_activity).replace('Z', '+00:00'))
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
+                else:
+                    dt = datetime.strptime(str(last_activity), '%Y-%m-%d %H:%M:%S')
+            else:
+                dt = datetime.now()
+        except:
+            dt = datetime.now()
+
+        if not project_name:
+            project_name = 'deleted'
+
+        orphaned.append({
+            'session_id': session_id,
+            'project': project_name,
+            'title': custom_name or get_session_title(session_id, None),
+            'relative_time': relative_time(dt),
+            'message_count': message_count,
+            'last_activity': dt,
+            'transcript_path': None,
+            'orphaned': True,
+        })
+
+        if len(orphaned) >= limit:
+            break
+
+    conn.close()
+    orphaned.sort(key=lambda x: x['last_activity'], reverse=True)
+    return orphaned
+
+
 class RenameScreen(ModalScreen):
     """Modal screen for renaming a session."""
 
@@ -403,16 +495,47 @@ class RenameScreen(ModalScreen):
             self.dismiss(None)
 
 
-class PreviewScreen(ModalScreen):
-    """Modal screen for previewing a session with conversation format."""
+class SearchInput(Input):
+    """Custom Input that sends arrow key events to parent for search navigation."""
 
     BINDINGS = [
-        Binding("escape", "close", "Close", show=False),
+        Binding("left", "nav_prev", "Previous match", show=False),
+        Binding("right", "nav_next", "Next match", show=False),
+    ]
+
+    def action_nav_prev(self) -> None:
+        """Navigate to previous search result."""
+        screen = self.screen
+        if hasattr(screen, 'action_find_prev'):
+            screen.action_find_prev()
+
+    def action_nav_next(self) -> None:
+        """Navigate to next search result."""
+        screen = self.screen
+        if hasattr(screen, 'action_find_next'):
+            screen.action_find_next()
+
+
+class PreviewScreen(ModalScreen):
+    """Modal screen for previewing a session with conversation format.
+
+    Features:
+    - Full conversation preview with syntax highlighting
+    - In-preview search with Ctrl+F (navigate with arrows for next/prev)
+    - Export to markdown/clipboard
+    - Open session in Claude Code
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_or_cancel_search", "Close", show=False),
         Binding("q", "close", "Close", show=False),
         Binding("e", "export_file", "Export", show=False),
         Binding("c", "copy_clipboard", "Copy", show=False),
         Binding("o", "open_claude", "Open", show=False),
-        Binding("enter", "open_claude", "Open in Claude", show=False),
+        Binding("enter", "open_claude_or_confirm", "Open in Claude", show=False),
+        Binding("ctrl+f", "toggle_search", "Find", show=False),
+        Binding("f3", "find_next", "Next", show=False),
+        Binding("shift+f3", "find_prev", "Prev", show=False),
     ]
 
     CSS = """
@@ -446,11 +569,48 @@ class PreviewScreen(ModalScreen):
         padding: 1 2;
     }
 
+    #search-row {
+        height: 1;
+        display: none;
+        background: #2d2d2d;
+        margin-bottom: 1;
+    }
+
+    #search-row.visible {
+        display: block;
+    }
+
     #preview-footer {
-        height: auto;
+        height: 1;
         text-align: center;
         color: #888;
         margin-top: 1;
+    }
+
+    #search-label {
+        width: auto;
+        padding: 0 1;
+        color: #58a6ff;
+    }
+
+    #preview-search-input {
+        width: 30;
+        background: #1e1e1e;
+        border: none;
+        height: 1;
+    }
+
+    #search-info {
+        width: auto;
+        min-width: 15;
+        padding: 0 1;
+        color: #888;
+    }
+
+    #search-nav {
+        width: auto;
+        padding: 0 1;
+        color: #666;
     }
 
     #preview-status {
@@ -460,16 +620,24 @@ class PreviewScreen(ModalScreen):
     }
     """
 
-    def __init__(self, session: Dict[str, Any]):
+    def __init__(self, session: Dict[str, Any], initial_search: str = ""):
         super().__init__()
         self.session = session
+        self.search_mode = False
+        self.search_query = ""
+        self.initial_search = initial_search  # Search term from parent browser
+        self.match_lines: List[int] = []  # Line numbers containing matches
+        self.current_match_index = 0
+        self.raw_preview = ""  # Store raw preview content
+        self.preview_lines: List[str] = []  # Lines for search
 
     def compose(self) -> ComposeResult:
-        preview = get_session_preview(
+        self.raw_preview = get_session_preview(
             self.session['session_id'],
             self.session.get('transcript_path'),
             max_messages=50  # Show more messages in full preview
         )
+        self.preview_lines = self.raw_preview.split('\n')
 
         title = self.session.get('custom_name') or self.session.get('title', 'Session')
         if len(title) > 60:
@@ -477,18 +645,232 @@ class PreviewScreen(ModalScreen):
 
         yield Container(
             Static(f"📋 {title}", id="preview-title"),
+            Horizontal(
+                Static("🔍", id="search-label"),
+                SearchInput(placeholder="search...", id="preview-search-input"),
+                Static("", id="search-info"),
+                Static("[dim]Enter:next · Esc:close[/dim]", id="search-nav"),
+                id="search-row"
+            ),
             VerticalScroll(
-                Static(preview, id="preview-content", markup=True),
+                Static(self.raw_preview, id="preview-content", markup=True),
                 id="preview-scroll"
             ),
             Static("", id="preview-status"),
-            Static("↑↓:Scroll · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close", id="preview-footer"),
+            Static("↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close", id="preview-footer"),
             id="preview-dialog"
         )
+
+    def on_mount(self) -> None:
+        """Initialize preview, activate search if initial_search provided."""
+        if self.initial_search:
+            # Activate search mode with the initial term
+            search_row = self.query_one("#search-row", Horizontal)
+            preview_footer = self.query_one("#preview-footer", Static)
+            search_input = self.query_one("#preview-search-input", SearchInput)
+
+            search_row.add_class("visible")
+            preview_footer.add_class("hidden")
+            self.search_mode = True
+            search_input.value = self.initial_search
+            self.search_query = self.initial_search
+            self._perform_search()
+            search_input.focus()
+
+    def action_toggle_search(self) -> None:
+        """Toggle search bar visibility in footer."""
+        search_row = self.query_one("#search-row", Horizontal)
+        preview_footer = self.query_one("#preview-footer", Static)
+        search_input = self.query_one("#preview-search-input", SearchInput)
+
+        if self.search_mode:
+            # Hide search row, show normal footer
+            search_row.remove_class("visible")
+            preview_footer.remove_class("hidden")
+            self.search_mode = False
+            self._clear_highlights()
+            self.search_query = ""
+            search_input.value = ""
+        else:
+            # Show search row, hide normal footer
+            search_row.add_class("visible")
+            preview_footer.add_class("hidden")
+            self.search_mode = True
+            search_input.focus()
+
+    def action_close_or_cancel_search(self) -> None:
+        """Close search if active, otherwise close preview."""
+        if self.search_mode:
+            self.action_toggle_search()
+        else:
+            self.action_close()
+
+    def action_open_claude_or_confirm(self) -> None:
+        """If in search mode, go to next match. Otherwise open in Claude."""
+        if self.search_mode:
+            self.action_find_next()
+        else:
+            self.action_open_claude()
 
     def action_close(self) -> None:
         """Close the preview and return to session list."""
         self.dismiss()
+
+    @on(Input.Changed, "#preview-search-input")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        """Update search results as user types."""
+        self.search_query = event.value
+        self._perform_search()
+
+    @on(Input.Submitted, "#preview-search-input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        """Go to next match when Enter is pressed in search."""
+        self.action_find_next()
+
+    def _perform_search(self) -> None:
+        """Find all matches and highlight them."""
+        query = self.search_query.strip().lower()
+        self.match_lines = []
+        self.current_match_index = 0
+
+        if not query:
+            self._clear_highlights()
+            self._update_search_info()
+            return
+
+        # Find lines containing the query (case-insensitive)
+        for i, line in enumerate(self.preview_lines):
+            # Strip Rich markup for search
+            plain_line = self._strip_markup(line).lower()
+            if query in plain_line:
+                self.match_lines.append(i)
+
+        self._update_search_info()
+        self._highlight_content()
+
+        # Scroll to first match
+        if self.match_lines:
+            self._scroll_to_match(0)
+
+    def _strip_markup(self, text: str) -> str:
+        """Remove Rich markup tags from text for plain search."""
+        # Remove [tag] and [/tag] patterns
+        return re.sub(r'\[[^\]]*\]', '', text)
+
+    def _highlight_content(self) -> None:
+        """Update content with highlighted matches."""
+        if not self.search_query.strip():
+            return
+
+        query = self.search_query.strip()
+        highlighted_lines = []
+
+        for i, line in enumerate(self.preview_lines):
+            if i in self.match_lines:
+                # Highlight matches in this line
+                # Check if this is the current match line
+                is_current = (self.match_lines and
+                              self.current_match_index < len(self.match_lines) and
+                              self.match_lines[self.current_match_index] == i)
+
+                highlighted_line = self._highlight_line(line, query, is_current)
+                highlighted_lines.append(highlighted_line)
+            else:
+                highlighted_lines.append(line)
+
+        content = self.query_one("#preview-content", Static)
+        content.update('\n'.join(highlighted_lines))
+
+    def _highlight_line(self, line: str, query: str, is_current: bool) -> str:
+        """Highlight query matches in a single line."""
+        # For Rich markup, we need to be careful not to break existing tags
+        # Simple approach: highlight in the visible text parts
+        result = []
+        i = 0
+        line_lower = line.lower()
+        query_lower = query.lower()
+
+        while i < len(line):
+            # Check if we're at a Rich markup tag
+            if line[i] == '[':
+                # Find the end of the tag
+                end = line.find(']', i)
+                if end != -1:
+                    result.append(line[i:end+1])
+                    i = end + 1
+                    continue
+
+            # Check for match at this position
+            if line_lower[i:i+len(query)] == query_lower:
+                matched_text = line[i:i+len(query)]
+                if is_current:
+                    # Current match: green highlight
+                    result.append(f"[black on green]{matched_text}[/black on green]")
+                else:
+                    # Other matches: yellow highlight
+                    result.append(f"[black on yellow]{matched_text}[/black on yellow]")
+                i += len(query)
+            else:
+                result.append(line[i])
+                i += 1
+
+        return ''.join(result)
+
+    def _clear_highlights(self) -> None:
+        """Restore original content without highlights."""
+        content = self.query_one("#preview-content", Static)
+        content.update(self.raw_preview)
+
+    def _update_search_info(self) -> None:
+        """Update the match count display with format 'term X of Y'."""
+        search_info = self.query_one("#search-info", Static)
+        query = self.search_query.strip()
+        if not query:
+            search_info.update("")
+        elif not self.match_lines:
+            search_info.update("[red]no matches[/red]")
+        else:
+            current = self.current_match_index + 1
+            total = len(self.match_lines)
+            # Show truncated query if too long
+            display_query = query if len(query) <= 15 else query[:12] + "..."
+            search_info.update(f"[cyan]{display_query}[/cyan] [white]{current} of {total}[/white]")
+
+    def _scroll_to_match(self, match_index: int) -> None:
+        """Scroll to show the specified match (instant jump, no animation)."""
+        if not self.match_lines or match_index >= len(self.match_lines):
+            return
+
+        line_num = self.match_lines[match_index]
+        scroll = self.query_one("#preview-scroll", VerticalScroll)
+
+        # Calculate approximate scroll position
+        # Each line is roughly 1 unit of height
+        total_lines = len(self.preview_lines)
+        if total_lines > 0:
+            # Scroll to position the match near the top third of the viewport
+            scroll_fraction = max(0, (line_num - 5) / total_lines)
+            scroll.scroll_to(y=scroll_fraction * scroll.max_scroll_y, animate=False)
+
+    def action_find_next(self) -> None:
+        """Go to next match."""
+        if not self.match_lines:
+            return
+
+        self.current_match_index = (self.current_match_index + 1) % len(self.match_lines)
+        self._update_search_info()
+        self._highlight_content()
+        self._scroll_to_match(self.current_match_index)
+
+    def action_find_prev(self) -> None:
+        """Go to previous match."""
+        if not self.match_lines:
+            return
+
+        self.current_match_index = (self.current_match_index - 1) % len(self.match_lines)
+        self._update_search_info()
+        self._highlight_content()
+        self._scroll_to_match(self.current_match_index)
 
     def action_export_file(self) -> None:
         """Export session to Markdown file."""
@@ -621,6 +1003,26 @@ class SessionBrowser(App):
         color: #888888;
         padding: 0 1;
     }
+
+    #loading-container {
+        width: 100%;
+        height: 1fr;
+        align: center middle;
+    }
+
+    #loading-container.hidden {
+        display: none;
+    }
+
+    #loading-text {
+        text-align: center;
+        color: #58a6ff;
+        padding: 1;
+    }
+
+    #session-tree.hidden {
+        display: none;
+    }
     """
 
     BINDINGS = [
@@ -631,6 +1033,7 @@ class SessionBrowser(App):
         Binding("ctrl+v", "preview", "Preview", show=True),
         Binding("ctrl+r", "rename", "Rename", show=True),
         Binding("ctrl+a", "toggle_all", "Fold All", show=True),
+        Binding("ctrl+o", "toggle_orphans", "Orphans", show=True),
         Binding("ctrl+f", "focus_search", "Search", show=False),
         Binding("up", "cursor_up", "Up", show=False, priority=True),
         Binding("down", "cursor_down", "Down", show=False, priority=True),
@@ -638,28 +1041,80 @@ class SessionBrowser(App):
         Binding("right", "expand_group", "Expand", show=False, priority=True),
     ]
 
-    def __init__(self, project_filter: Optional[str] = None):
+    def __init__(self, project_filter: Optional[str] = None, orphans_only: bool = False):
         super().__init__()
         self.project_filter = project_filter
+        self.orphans_only = orphans_only
         self.all_sessions: List[Dict[str, Any]] = []
         self.session_nodes: Dict[str, TreeNode] = {}
         self.all_expanded: bool = True  # Track expand/collapse all state
+        self.loading = True
 
     def compose(self) -> ComposeResult:
-        yield Static("Browse Sessions", id="header")
+        header_text = "Orphaned Sessions (deleted by Claude)" if self.orphans_only else "Browse Sessions"
+        yield Static(header_text, id="header")
         yield Container(Input(placeholder="🔍 Type to search...", id="search-input"), id="search-box")
-        yield Tree("Sessions", id="session-tree")
-        yield Static("↑↓:nav · ←→:fold · ^A:fold all · Enter:select · ^V:preview · ^E:export · Esc:quit", id="footer")
+        yield Container(
+            LoadingIndicator(),
+            Static("Loading sessions...", id="loading-text"),
+            id="loading-container"
+        )
+        yield Tree("Sessions", id="session-tree", classes="hidden")
+        yield Static("↑↓:nav · ←→:fold · ^A:fold all · ^O:orphans · Enter:select · ^V:preview · ^E:export", id="footer")
 
     def on_mount(self) -> None:
-        """Initialize."""
+        """Initialize with async loading."""
         init_db()
-        self.load_sessions()
+        self._load_sessions_async()
+
+    @work(exclusive=True, thread=True)
+    def _load_sessions_async(self) -> None:
+        """Load sessions in background thread."""
+        try:
+            if self.orphans_only:
+                sessions = get_orphaned_sessions(limit=200)
+            else:
+                sessions = get_enriched_sessions(limit=100)
+            # Call UI update on main thread
+            self.call_from_thread(self._on_sessions_loaded, sessions)
+        except Exception as e:
+            import traceback
+            self.call_from_thread(self._on_load_error, str(e), traceback.format_exc())
+
+    def _on_sessions_loaded(self, sessions: List[Dict[str, Any]]) -> None:
+        """Called when sessions are loaded - update UI."""
+        self.all_sessions = sessions
+        self.loading = False
+
+        # Hide loading, show tree
+        loading = self.query_one("#loading-container", Container)
         tree = self.query_one("#session-tree", Tree)
-        tree.root.expand()
-        tree.focus()
-        # Position cursor on first session node (skip metadata)
-        self.call_later(self._select_first_session)
+        loading.add_class("hidden")
+        tree.remove_class("hidden")
+
+        # Build tree and focus
+        try:
+            self._build_tree(sessions)
+            tree.root.expand()
+            tree.focus()
+            self.call_later(self._select_first_session)
+        except Exception as e:
+            import traceback
+            import sys
+            header = self.query_one("#header", Static)
+            header.update(f"Error building tree: {e}")
+            print(traceback.format_exc(), file=sys.stderr)
+
+    def _on_load_error(self, error: str, traceback_str: str) -> None:
+        """Called when session loading fails."""
+        self.loading = False
+        loading = self.query_one("#loading-container", Container)
+        loading.add_class("hidden")
+        header = self.query_one("#header", Static)
+        header.update(f"Error loading sessions: {error}")
+        # Log full traceback
+        import sys
+        print(traceback_str, file=sys.stderr)
 
     def _select_first_session(self) -> None:
         """Select the first navigable node (group or session)."""
@@ -672,9 +1127,10 @@ class SessionBrowser(App):
             attempts += 1
 
     def load_sessions(self, search_query: str = "") -> None:
-        """Load and display sessions, searching in content when query >= 3 chars."""
-        if not self.all_sessions:
-            self.all_sessions = get_enriched_sessions(limit=100)
+        """Filter and display sessions, searching in content when query >= 3 chars."""
+        # Skip if still loading
+        if self.loading:
+            return
 
         # Filter
         sessions = self.all_sessions
@@ -727,11 +1183,19 @@ class SessionBrowser(App):
             # Combine title matches + content matches
             sessions = title_matches + content_sessions
 
-        # Update header
+        self._build_tree(sessions)
+
+    def _build_tree(self, sessions: List[Dict[str, Any]]) -> None:
+        """Build the session tree from a list of sessions."""
+        # Update header (preserve orphan mode indicator)
         header = self.query_one("#header", Static)
         total = len(self.all_sessions)
         filtered = len(sessions)
-        header.update(f"Browse Sessions ({filtered} of {total})" if filtered != total else f"Browse Sessions ({total})")
+        prefix = "Orphaned Sessions" if self.orphans_only else "Browse Sessions"
+        if filtered != total:
+            header.update(f"{prefix} ({filtered} of {total})")
+        else:
+            header.update(f"{prefix} ({total})")
 
         # Build tree
         tree = self.query_one("#session-tree", Tree)
@@ -791,6 +1255,21 @@ class SessionBrowser(App):
     def on_search(self, event: Input.Changed) -> None:
         self.load_sessions(event.value)
 
+    @on(Input.Submitted, "#search-input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        """Select current session when Enter is pressed in search."""
+        self.action_select()
+
+    @on(Tree.NodeSelected, "#session-tree")
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        """Prevent session nodes from collapsing on click (only groups can toggle)."""
+        node = event.node
+        # If it's a session node (has session_id), prevent toggle by re-expanding
+        if self._is_session_node(node):
+            # Re-expand the node to prevent it from collapsing
+            if not node.is_expanded:
+                node.expand()
+
     def action_select(self) -> None:
         session = self.get_selected_session()
         if session:
@@ -818,7 +1297,9 @@ class SessionBrowser(App):
                     # Export action from preview - exit browser with this action
                     self.exit(result)
 
-            self.push_screen(PreviewScreen(session), on_preview_result)
+            # Pass current search query to preview for initial search
+            search_query = self.query_one("#search-input", Input).value
+            self.push_screen(PreviewScreen(session, initial_search=search_query), on_preview_result)
 
     def action_rename(self) -> None:
         session = self.get_selected_session()
@@ -907,6 +1388,24 @@ class SessionBrowser(App):
                 group.expand()
             self.all_expanded = True
 
+    def action_toggle_orphans(self) -> None:
+        """Toggle between all sessions and orphaned sessions only (Ctrl+O)."""
+        self.orphans_only = not self.orphans_only
+        self.loading = True
+
+        # Show loading indicator
+        loading = self.query_one("#loading-container", Container)
+        tree = self.query_one("#session-tree", Tree)
+        tree.add_class("hidden")
+        loading.remove_class("hidden")
+
+        # Clear search
+        search_input = self.query_one("#search-input", Input)
+        search_input.value = ""
+
+        # Reload sessions
+        self._load_sessions_async()
+
     def _is_navigable_node(self, node) -> bool:
         """Check if node is navigable (session or project group, not metadata)."""
         return self._is_session_node(node) or self._is_group_node(node)
@@ -933,15 +1432,65 @@ class SessionBrowser(App):
 
     def on_key(self, event) -> None:
         search = self.query_one("#search-input", Input)
+        tree = self.query_one("#session-tree", Tree)
+
+        # If search input has focus, handle navigation and shortcuts
+        if search.has_focus:
+            # Arrow up/down: navigate tree without losing search focus
+            if event.key == "down":
+                self.action_cursor_down()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "up":
+                self.action_cursor_up()
+                event.prevent_default()
+                event.stop()
+                return
+            # Ctrl shortcuts: execute actions even when input has focus
+            elif event.key == "ctrl+v":
+                self.action_preview()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "ctrl+e":
+                self.action_export_md()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "ctrl+j":
+                self.action_export_json()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "ctrl+r":
+                self.action_rename()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "ctrl+a":
+                self.action_toggle_all()
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "escape":
+                # Clear search and focus tree
+                search.value = ""
+                tree.focus()
+                event.prevent_default()
+                event.stop()
+                return
+
+        # Auto-focus search when typing printable characters
         if event.character and event.character.isprintable() and not search.has_focus:
             search.focus()
             search.value += event.character
             search.cursor_position = len(search.value)
 
 
-def run_browser(project_filter: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def run_browser(project_filter: Optional[str] = None, orphans_only: bool = False) -> Optional[Dict[str, Any]]:
     """Run the TUI browser."""
-    app = SessionBrowser(project_filter=project_filter)
+    app = SessionBrowser(project_filter=project_filter, orphans_only=orphans_only)
     return app.run()
 
 

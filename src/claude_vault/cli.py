@@ -1211,8 +1211,9 @@ def uninstall(keep_db: bool):
 
 @main.command()
 @click.option("-p", "--project", default=None, help="Filter by project name")
+@click.option("--orphans", is_flag=True, help="Show only sessions deleted by Claude (file no longer exists)")
 @click.pass_context
-def browse(ctx, project: Optional[str]):
+def browse(ctx, project: Optional[str], orphans: bool):
     """Interactive TUI to browse and search sessions (like claude --resume).
 
     \b
@@ -1232,9 +1233,10 @@ def browse(ctx, project: Optional[str]):
 
     \b
     Examples:
-        claude-vault             # Opens browse directly
+        claude-vault                  # Opens browse directly
         claude-vault browse
         claude-vault browse --project fps-api
+        claude-vault browse --orphans # Show sessions deleted by Claude
     """
     try:
         from claude_vault.tui import run_browser
@@ -1244,7 +1246,7 @@ def browse(ctx, project: Optional[str]):
         return
 
     try:
-        result = run_browser(project_filter=project)
+        result = run_browser(project_filter=project, orphans_only=orphans)
 
         if result is None:
             # User cancelled

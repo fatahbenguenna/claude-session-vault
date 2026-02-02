@@ -676,12 +676,18 @@ def search_sessions_with_content(
 
     Returns sessions enriched with data from both sessions table (if available)
     and transcript_entries (always available for synced sessions).
+
+    Uses FTS5 with prefix search first, then falls back to LIKE for substring matches.
     """
     conn = get_connection(db_path)
     cursor = conn.cursor()
+    results = []
+
+    # Prepare FTS query with prefix search (word*)
+    fts_query = f'"{query}"*'
 
     try:
-        # FTS search with LEFT JOIN to include sessions not in sessions table
+        # FTS search with prefix matching
         cursor.execute("""
             SELECT
                 t.session_id,
@@ -697,9 +703,13 @@ def search_sessions_with_content(
             GROUP BY t.session_id
             ORDER BY last_activity DESC
             LIMIT ?
-        """, (query, limit))
+        """, (fts_query, limit))
+        results = [dict(row) for row in cursor.fetchall()]
     except sqlite3.OperationalError:
-        # Fallback to LIKE
+        pass
+
+    # If no FTS results, fallback to LIKE for substring search
+    if not results:
         cursor.execute("""
             SELECT
                 t.session_id,
@@ -710,15 +720,14 @@ def search_sessions_with_content(
                 COUNT(*) as entry_count
             FROM transcript_entries t
             LEFT JOIN sessions s ON t.session_id = s.session_id
-            WHERE t.content LIKE ?
+            WHERE t.content LIKE ? COLLATE NOCASE
             GROUP BY t.session_id
             ORDER BY last_activity DESC
             LIMIT ?
         """, (f"%{query}%", limit))
+        results = [dict(row) for row in cursor.fetchall()]
 
-    results = [dict(row) for row in cursor.fetchall()]
     conn.close()
-
     return results
 
 
@@ -727,12 +736,19 @@ def search_sessions_by_content(
     limit: int = 20,
     db_path: Optional[Path] = None
 ) -> List[str]:
-    """Search and return unique session IDs that contain the query in their content."""
+    """Search and return unique session IDs that contain the query in their content.
+
+    Uses FTS5 with prefix search first, then falls back to LIKE for substring matches.
+    """
     conn = get_connection(db_path)
     cursor = conn.cursor()
+    results = []
+
+    # Prepare FTS query with prefix search (word*)
+    fts_query = f'"{query}"*'
 
     try:
-        # Try FTS5 search first
+        # Try FTS5 search with prefix
         cursor.execute("""
             SELECT DISTINCT t.session_id
             FROM transcript_entries t
@@ -740,18 +756,22 @@ def search_sessions_by_content(
             WHERE transcript_fts MATCH ?
             ORDER BY t.timestamp DESC
             LIMIT ?
-        """, (query, limit))
+        """, (fts_query, limit))
+        results = [row[0] for row in cursor.fetchall()]
     except sqlite3.OperationalError:
-        # Fallback to LIKE
+        pass
+
+    # If no FTS results, fallback to LIKE for substring search
+    if not results:
         cursor.execute("""
             SELECT DISTINCT session_id
             FROM transcript_entries
-            WHERE content LIKE ?
+            WHERE content LIKE ? COLLATE NOCASE
             ORDER BY timestamp DESC
             LIMIT ?
         """, (f"%{query}%", limit))
+        results = [row[0] for row in cursor.fetchall()]
 
-    results = [row[0] for row in cursor.fetchall()]
     conn.close()
 
     return results
