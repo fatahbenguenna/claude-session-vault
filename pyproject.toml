@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "claude-session-vault"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Persist and search Claude Code sessions in SQLite"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,3 +48,32 @@ include = [
     "/src",
     "/README.md",
 ]
+
+# Version from git tags (hatch-vcs)
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/claude_vault/_version.py"
+
+# Semantic Release Configuration
+[tool.semantic_release]
+version_toml = []  # We use hatch-vcs, not toml
+version_variables = []
+branch = "main"
+upload_to_pypi = false
+upload_to_release = true
+build_command = "pip install hatch && hatch build"
+commit_message = "chore(release): {version} [skip ci]"
+
+[tool.semantic_release.changelog]
+changelog_file = "CHANGELOG.md"
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.commit_parser_options]
+allowed_tags = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore"]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]

@@ -54,3 +54,6 @@ Thumbs.db
 
 # Claude Code local config
 .claude/
+
+# Generated version file (hatch-vcs)
+src/claude_vault/_version.py
