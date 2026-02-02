@@ -438,6 +438,380 @@ def parse_db_transcript_entries(entries: list) -> list:
     return parse_transcript_to_messages(entries, from_raw_json=True)
 
 
+# =============================================================================
+# Sync Command Helpers
+# =============================================================================
+
+
+def scan_filesystem_sessions(exclude_subagents: bool = True) -> dict:
+    """Scan ~/.claude/projects for all JSONL session files.
+
+    Args:
+        exclude_subagents: If True, exclude subagent sessions (agent-* prefix)
+
+    Returns:
+        Dict mapping session_id -> file_path
+    """
+    claude_projects = Path.home() / ".claude" / "projects"
+    sessions = {}
+
+    if not claude_projects.exists():
+        return sessions
+
+    for jsonl_file in claude_projects.rglob("*.jsonl"):
+        session_id = jsonl_file.stem
+        # Skip subagent sessions if requested
+        if exclude_subagents:
+            if '/subagents/' in str(jsonl_file) or '\\subagents\\' in str(jsonl_file) or session_id.startswith('agent-'):
+                continue
+        sessions[session_id] = str(jsonl_file)
+
+    return sessions
+
+
+def get_orphaned_session_ids(cursor) -> set:
+    """Get session IDs that exist in DB but not in filesystem."""
+    fs_sessions = scan_filesystem_sessions()
+    fs_session_ids = set(fs_sessions.keys())
+
+    cursor.execute("SELECT DISTINCT session_id FROM transcript_entries")
+    db_session_ids = set(row[0] for row in cursor.fetchall())
+
+    return db_session_ids - fs_session_ids
+
+
+def clear_resyncable_entries(cursor, conn, verbose: bool = True) -> int:
+    """Clear transcript entries for sessions that can be re-synced (files exist).
+
+    Preserves orphaned sessions (files deleted by Claude).
+
+    Returns:
+        Number of entries deleted
+    """
+    fs_sessions = scan_filesystem_sessions()
+    fs_session_ids = set(fs_sessions.keys())
+
+    cursor.execute("SELECT DISTINCT session_id FROM transcript_entries")
+    db_session_ids = set(row[0] for row in cursor.fetchall())
+
+    orphaned_ids = db_session_ids - fs_session_ids
+    resyncable_ids = db_session_ids & fs_session_ids
+
+    if orphaned_ids and verbose:
+        console.print(f"[cyan]Preserving {len(orphaned_ids)} orphaned sessions (files deleted by Claude)[/cyan]")
+
+    if not resyncable_ids:
+        return 0
+
+    placeholders = ','.join('?' * len(resyncable_ids))
+    cursor.execute(f"SELECT COUNT(*) FROM transcript_entries WHERE session_id IN ({placeholders})", list(resyncable_ids))
+    count = cursor.fetchone()[0]
+
+    if count > 0:
+        if verbose:
+            console.print(f"[yellow]Deleting {count} entries from {len(resyncable_ids)} re-syncable sessions...[/yellow]")
+        cursor.execute(f"DELETE FROM transcript_entries WHERE session_id IN ({placeholders})", list(resyncable_ids))
+        # Rebuild FTS index for deleted entries
+        try:
+            cursor.execute(f"DELETE FROM transcript_fts WHERE session_id IN ({placeholders})", list(resyncable_ids))
+        except:
+            pass
+        conn.commit()
+        if verbose:
+            console.print("[green]✓ Cleared re-syncable data (orphans preserved)[/green]")
+
+    return count
+
+
+def sync_single_session_by_id(session_prefix: str, cursor, conn) -> bool:
+    """Sync a single session by ID prefix.
+
+    Returns:
+        True if session was found and synced, False otherwise
+    """
+    from claude_vault.db import sync_transcript_entries
+
+    # Try to find in events table first
+    cursor.execute("""
+        SELECT DISTINCT session_id, transcript_path
+        FROM events
+        WHERE session_id LIKE ? AND transcript_path IS NOT NULL
+        LIMIT 1
+    """, (f"{session_prefix}%",))
+    row = cursor.fetchone()
+
+    if row:
+        full_session_id, transcript_path = row[0], row[1]
+        synced = sync_transcript_entries(full_session_id, transcript_path)
+        console.print(f"[green]Synced {synced} entries for session {full_session_id[:8]}[/green]")
+        return True
+
+    # Try finding the JSONL file directly
+    fs_sessions = scan_filesystem_sessions()
+    for session_id, file_path in fs_sessions.items():
+        if session_id.startswith(session_prefix):
+            synced = sync_transcript_entries(session_id, file_path)
+            console.print(f"[green]Synced {synced} entries for session {session_id[:8]}[/green]")
+            return True
+
+    console.print(f"[red]Session '{session_prefix}' not found[/red]")
+    return False
+
+
+def sync_all_filesystem_sessions() -> tuple:
+    """Sync all JSONL files from filesystem.
+
+    Returns:
+        Tuple of (total_entries_synced, sessions_synced_count)
+    """
+    from claude_vault.db import sync_transcript_entries
+
+    fs_sessions = scan_filesystem_sessions()
+
+    if not fs_sessions:
+        console.print("[yellow]No Claude projects directory found[/yellow]")
+        return 0, 0
+
+    console.print(f"[cyan]Found {len(fs_sessions)} JSONL files to scan...[/cyan]")
+
+    synced_total = 0
+    sessions_synced = 0
+
+    with console.status("[bold green]Syncing transcripts...") as status:
+        for session_id, file_path in fs_sessions.items():
+            try:
+                new_entries = sync_transcript_entries(session_id, file_path)
+                if new_entries > 0:
+                    synced_total += new_entries
+                    sessions_synced += 1
+                    status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
+            except Exception:
+                pass  # Skip errors silently
+
+    return synced_total, sessions_synced
+
+
+def sync_tracked_sessions(cursor) -> tuple:
+    """Sync only sessions tracked by hooks (in events table).
+
+    Returns:
+        Tuple of (total_entries_synced, sessions_synced_count)
+    """
+    from claude_vault.db import sync_transcript_entries
+
+    cursor.execute("""
+        SELECT DISTINCT session_id, transcript_path
+        FROM events
+        WHERE transcript_path IS NOT NULL
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        console.print("[yellow]No sessions tracked yet. Use --all to scan all JSONL files.[/yellow]")
+        return 0, 0
+
+    console.print(f"[cyan]Found {len(rows)} tracked sessions to sync...[/cyan]")
+
+    synced_total = 0
+    sessions_synced = 0
+
+    with console.status("[bold green]Syncing sessions...") as status:
+        for row in rows:
+            session_id, transcript_path = row[0], row[1]
+            status.update(f"[bold green]Syncing {session_id[:8]}...")
+            try:
+                synced = sync_transcript_entries(session_id, transcript_path)
+                if synced > 0:
+                    synced_total += synced
+                    sessions_synced += 1
+            except:
+                pass
+
+    return synced_total, sessions_synced
+
+
+# =============================================================================
+# Check Command Helpers
+# =============================================================================
+
+
+def categorize_orphaned_sessions(cursor, orphaned_ids: set) -> tuple:
+    """Split orphaned sessions into those with content and empty ones.
+
+    Args:
+        cursor: Database cursor
+        orphaned_ids: Set of session IDs without corresponding files
+
+    Returns:
+        Tuple of (set_with_content, set_empty)
+    """
+    with_content = set()
+    empty = set()
+
+    for session_id in orphaned_ids:
+        cursor.execute(
+            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ? AND entry_type IN ('user', 'human', 'assistant')",
+            (session_id,)
+        )
+        count = cursor.fetchone()[0]
+        if count > 0:
+            with_content.add(session_id)
+        else:
+            empty.add(session_id)
+
+    return with_content, empty
+
+
+def check_entry_count_mismatches(cursor, fs_sessions: dict, db_sessions: set) -> list:
+    """Find sessions where file and DB entry counts differ.
+
+    Returns:
+        List of dicts with session_id, file_entries, db_entries, diff
+    """
+    mismatches = []
+
+    for session_id in fs_sessions.keys() & db_sessions:
+        file_path = fs_sessions[session_id]
+        try:
+            with open(file_path, 'r') as f:
+                file_entries = sum(1 for line in f if line.strip())
+        except:
+            continue
+
+        cursor.execute("SELECT COUNT(*) FROM transcript_entries WHERE session_id = ?", (session_id,))
+        db_entries = cursor.fetchone()[0]
+
+        if file_entries != db_entries and db_entries > 0:
+            mismatches.append({
+                'session_id': session_id,
+                'file_entries': file_entries,
+                'db_entries': db_entries,
+                'diff': file_entries - db_entries
+            })
+
+    return mismatches
+
+
+def display_check_missing(missing_in_db: set, fs_sessions: dict, verbose: bool):
+    """Display missing sessions (in filesystem but not in DB)."""
+    if not missing_in_db:
+        return
+
+    console.print(Panel(
+        f"[yellow]{len(missing_in_db)}[/yellow] sessions exist in filesystem but not in database",
+        title="[bold yellow]Missing in Database[/bold yellow]",
+        border_style="yellow"
+    ))
+
+    if verbose:
+        table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+        table.add_column("Session ID", style="cyan")
+        table.add_column("File Path", style="dim")
+        for session_id in sorted(list(missing_in_db))[:20]:
+            table.add_row(session_id[:12] + "...", fs_sessions[session_id])
+        if len(missing_in_db) > 20:
+            table.add_row(f"... and {len(missing_in_db) - 20} more", "")
+        console.print(table)
+
+    console.print("")
+
+
+def display_check_orphaned(orphaned_with_content: set, orphaned_empty: set, verbose: bool):
+    """Display orphaned sessions (in DB but not in filesystem)."""
+    # Recoverable orphans
+    if orphaned_with_content:
+        console.print(Panel(
+            f"[green]{len(orphaned_with_content)}[/green] sessions recoverable (file deleted but content preserved in vault)",
+            title="[bold green]Orphaned - Recoverable[/bold green]",
+            border_style="green"
+        ))
+        if verbose:
+            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+            table.add_column("Session ID", style="cyan")
+            for session_id in sorted(list(orphaned_with_content))[:20]:
+                table.add_row(session_id[:12] + "...")
+            if len(orphaned_with_content) > 20:
+                table.add_row(f"... and {len(orphaned_with_content) - 20} more")
+            console.print(table)
+        console.print("[dim]View with: claude-vault browse --orphans[/dim]")
+        console.print("")
+
+    # Empty orphans
+    if orphaned_empty:
+        console.print(Panel(
+            f"[dim]{len(orphaned_empty)}[/dim] empty sessions (file deleted, no content in vault)",
+            title="[dim]Orphaned - Empty[/dim]",
+            border_style="dim"
+        ))
+        if verbose:
+            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+            table.add_column("Session ID", style="dim")
+            for session_id in sorted(list(orphaned_empty))[:10]:
+                table.add_row(session_id[:12] + "...")
+            if len(orphaned_empty) > 10:
+                table.add_row(f"... and {len(orphaned_empty) - 10} more")
+            console.print(table)
+        console.print("")
+
+
+def display_check_out_of_sync(out_of_sync: list, verbose: bool):
+    """Display out-of-sync sessions (different entry counts)."""
+    if not out_of_sync:
+        return
+
+    console.print(Panel(
+        f"[magenta]{len(out_of_sync)}[/magenta] sessions have different entry counts",
+        title="[bold magenta]Out of Sync[/bold magenta]",
+        border_style="magenta"
+    ))
+
+    if verbose:
+        table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+        table.add_column("Session ID", style="cyan")
+        table.add_column("File", justify="right")
+        table.add_column("DB", justify="right")
+        table.add_column("Diff", justify="right")
+        for item in sorted(out_of_sync, key=lambda x: abs(x['diff']), reverse=True)[:20]:
+            diff_style = "green" if item['diff'] > 0 else "red"
+            table.add_row(
+                item['session_id'][:12] + "...",
+                str(item['file_entries']),
+                str(item['db_entries']),
+                f"[{diff_style}]{item['diff']:+d}[/{diff_style}]"
+            )
+        console.print(table)
+
+    console.print("")
+
+
+def fix_missing_sessions(missing_ids: set, fs_sessions: dict, verbose: bool = False) -> int:
+    """Sync missing sessions from filesystem.
+
+    Returns:
+        Number of sessions synced
+    """
+    from claude_vault.db import sync_transcript_entries, rebuild_sessions_from_transcripts
+
+    console.print("[cyan]Syncing missing sessions...[/cyan]")
+
+    synced_count = 0
+    with console.status("[bold green]Syncing...") as status:
+        for session_id in missing_ids:
+            file_path = fs_sessions[session_id]
+            try:
+                entries = sync_transcript_entries(session_id, file_path)
+                if entries > 0:
+                    synced_count += 1
+                    status.update(f"[bold green]Synced {synced_count} sessions...")
+            except Exception as e:
+                if verbose:
+                    console.print(f"[red]Error syncing {session_id[:8]}: {e}[/red]")
+
+    rebuild_sessions_from_transcripts()
+    console.print(f"[green]✅ Synced {synced_count} missing sessions[/green]")
+    return synced_count
+
+
 @main.command()
 @click.argument("output_path", type=click.Path())
 @click.option("-s", "--session", required=True, help="Session ID to export")
@@ -704,137 +1078,36 @@ def sync(session: Optional[str], sync_all: bool, force: bool):
         claude-vault sync --force      # Re-sync from scratch (deletes existing)
         claude-vault sync -s abc123    # Sync specific session
     """
-    from claude_vault.db import get_connection, sync_transcript_entries, init_db
+    from claude_vault.db import get_connection, init_db, rebuild_sessions_from_transcripts
 
     init_db()
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Handle --force: delete existing transcript entries (but preserve orphaned sessions)
+    # Handle --force: clear re-syncable entries (preserving orphans)
     if force:
-        # First, identify orphaned sessions (files deleted by Claude)
-        claude_projects = Path.home() / ".claude" / "projects"
-        fs_session_ids = set()
-        if claude_projects.exists():
-            for jsonl_file in claude_projects.rglob("*.jsonl"):
-                fs_session_ids.add(jsonl_file.stem)
+        clear_resyncable_entries(cursor, conn)
 
-        cursor.execute("SELECT DISTINCT session_id FROM transcript_entries")
-        db_session_ids = set(row[0] for row in cursor.fetchall())
-        orphaned_ids = db_session_ids - fs_session_ids
-
-        if orphaned_ids:
-            console.print(f"[cyan]Preserving {len(orphaned_ids)} orphaned sessions (files deleted by Claude)[/cyan]")
-
-        # Only delete entries for sessions that CAN be re-synced (have files)
-        resyncable_ids = db_session_ids & fs_session_ids
-        if resyncable_ids:
-            placeholders = ','.join('?' * len(resyncable_ids))
-            cursor.execute(f"SELECT COUNT(*) FROM transcript_entries WHERE session_id IN ({placeholders})", list(resyncable_ids))
-            count = cursor.fetchone()[0]
-            if count > 0:
-                console.print(f"[yellow]Deleting {count} entries from {len(resyncable_ids)} re-syncable sessions...[/yellow]")
-                cursor.execute(f"DELETE FROM transcript_entries WHERE session_id IN ({placeholders})", list(resyncable_ids))
-                # Rebuild FTS index for deleted entries
-                try:
-                    cursor.execute(f"DELETE FROM transcript_fts WHERE session_id IN ({placeholders})", list(resyncable_ids))
-                except:
-                    pass
-                conn.commit()
-                console.print("[green]✓ Cleared re-syncable data (orphans preserved)[/green]")
-
-    synced_total = 0
-    sessions_synced = 0
-
+    # Dispatch to appropriate sync strategy
     if session:
-        # Sync single session - find its transcript path
-        cursor.execute("""
-            SELECT DISTINCT session_id, transcript_path
-            FROM events
-            WHERE session_id LIKE ? AND transcript_path IS NOT NULL
-            LIMIT 1
-        """, (f"{session}%",))
-        row = cursor.fetchone()
-
-        if not row:
-            # Try finding the JSONL file directly
-            claude_projects = Path.home() / ".claude" / "projects"
-            for jsonl_file in claude_projects.rglob(f"{session}*.jsonl"):
-                full_session_id = jsonl_file.stem
-                synced = sync_transcript_entries(full_session_id, str(jsonl_file))
-                console.print(f"[green]Synced {synced} entries for session {full_session_id[:8]}[/green]")
-                conn.close()
-                return
-
-            console.print(f"[red]Session '{session}' not found[/red]")
-            conn.close()
-            return
-
-        full_session_id, transcript_path = row[0], row[1]
-        synced = sync_transcript_entries(full_session_id, transcript_path)
-        console.print(f"[green]Synced {synced} entries for session {full_session_id[:8]}[/green]")
+        sync_single_session_by_id(session, cursor, conn)
         conn.close()
         return
 
     if sync_all:
-        # Scan Claude's project directories for ALL JSONL files
-        claude_projects = Path.home() / ".claude" / "projects"
-        if not claude_projects.exists():
-            console.print("[yellow]No Claude projects directory found[/yellow]")
-            conn.close()
-            return
-
-        jsonl_files = list(claude_projects.rglob("*.jsonl"))
-        console.print(f"[cyan]Found {len(jsonl_files)} JSONL files to scan...[/cyan]")
-
-        with console.status("[bold green]Syncing transcripts...") as status:
-            for jsonl_file in jsonl_files:
-                session_id = jsonl_file.stem
-                try:
-                    new_entries = sync_transcript_entries(session_id, str(jsonl_file))
-                    if new_entries > 0:
-                        synced_total += new_entries
-                        sessions_synced += 1
-                        status.update(f"[bold green]Synced {sessions_synced} sessions ({synced_total} entries)")
-                except Exception as e:
-                    pass  # Skip errors silently
+        synced_total, sessions_synced = sync_all_filesystem_sessions()
     else:
-        # Sync only sessions tracked in the vault (from hooks)
-        cursor.execute("""
-            SELECT DISTINCT session_id, transcript_path
-            FROM events
-            WHERE transcript_path IS NOT NULL
-        """)
-        rows = cursor.fetchall()
-
-        if not rows:
-            console.print("[yellow]No sessions tracked yet. Use --all to scan all JSONL files.[/yellow]")
-            conn.close()
-            return
-
-        console.print(f"[cyan]Found {len(rows)} tracked sessions to sync...[/cyan]")
-
-        with console.status("[bold green]Syncing sessions...") as status:
-            for row in rows:
-                session_id, transcript_path = row[0], row[1]
-                status.update(f"[bold green]Syncing {session_id[:8]}...")
-                try:
-                    synced = sync_transcript_entries(session_id, transcript_path)
-                    if synced > 0:
-                        synced_total += synced
-                        sessions_synced += 1
-                except:
-                    pass
+        synced_total, sessions_synced = sync_tracked_sessions(cursor)
 
     conn.close()
 
+    # Report results
     if synced_total > 0:
         console.print(f"[green]✅ Synced {synced_total} entries across {sessions_synced} sessions[/green]")
     else:
         console.print("[dim]All transcripts already synced (no new content)[/dim]")
 
     # Rebuild sessions table from transcript entries
-    from claude_vault.db import rebuild_sessions_from_transcripts
     console.print("[cyan]Rebuilding sessions index...[/cyan]")
     created = rebuild_sessions_from_transcripts()
     if created > 0:
@@ -926,35 +1199,27 @@ def check(fix: bool, verbose: bool):
         claude-vault check --fix     # Sync missing sessions automatically
         claude-vault check -v        # Verbose output with details
     """
-    from claude_vault.db import get_connection, init_db, sync_transcript_entries
+    from claude_vault.db import get_connection, init_db
 
     init_db()
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. Get all JSONL files from filesystem
-    claude_projects = Path.home() / ".claude" / "projects"
-    if not claude_projects.exists():
+    # 1. Scan filesystem for JSONL files
+    console.print("[cyan]Scanning Claude projects directory...[/cyan]")
+    fs_sessions = scan_filesystem_sessions(exclude_subagents=True)
+
+    if not fs_sessions:
         console.print("[yellow]No Claude projects directory found at ~/.claude/projects[/yellow]")
         conn.close()
         return
 
-    console.print("[cyan]Scanning Claude projects directory...[/cyan]")
-    jsonl_files = list(claude_projects.rglob("*.jsonl"))
-    fs_sessions = {}  # session_id -> file_path
-    subagent_count = 0
-
-    for jsonl_file in jsonl_files:
-        session_id = jsonl_file.stem
-        # Skip subagent sessions - they don't trigger hooks
-        if '/subagents/' in str(jsonl_file) or '\\subagents\\' in str(jsonl_file) or session_id.startswith('agent-'):
-            subagent_count += 1
-            continue
-        fs_sessions[session_id] = str(jsonl_file)
-
+    # Count excluded subagents for reporting
+    all_sessions = scan_filesystem_sessions(exclude_subagents=False)
+    subagent_count = len(all_sessions) - len(fs_sessions)
     console.print(f"[dim]Found {len(fs_sessions)} JSONL files in filesystem (excluded {subagent_count} subagent sessions)[/dim]")
 
-    # 2. Get all sessions from database (excluding subagent sessions)
+    # 2. Get sessions from database (excluding subagents)
     cursor.execute("""
         SELECT DISTINCT session_id FROM sessions WHERE session_id NOT LIKE 'agent-%'
         UNION
@@ -965,136 +1230,30 @@ def check(fix: bool, verbose: bool):
 
     # 3. Calculate discrepancies
     fs_session_ids = set(fs_sessions.keys())
+    missing_in_db = fs_session_ids - db_sessions
+    orphaned_in_db = db_sessions - fs_session_ids
 
-    missing_in_db = fs_session_ids - db_sessions  # In filesystem, not in DB
-    orphaned_in_db_raw = db_sessions - fs_session_ids  # In DB, not in filesystem
+    # Categorize orphaned sessions
+    orphaned_with_content, orphaned_empty = categorize_orphaned_sessions(cursor, orphaned_in_db)
 
-    # Filter orphaned sessions: only those with actual transcript content are recoverable
-    orphaned_with_content = set()
-    orphaned_empty = set()
-    for session_id in orphaned_in_db_raw:
-        cursor.execute(
-            "SELECT COUNT(*) FROM transcript_entries WHERE session_id = ? AND entry_type IN ('user', 'human', 'assistant')",
-            (session_id,)
-        )
-        count = cursor.fetchone()[0]
-        if count > 0:
-            orphaned_with_content.add(session_id)
-        else:
-            orphaned_empty.add(session_id)
-
-    # 4. Check for entry count mismatches
+    # Check entry count mismatches (only in verbose mode)
     out_of_sync = []
     if verbose:
         console.print("[dim]Checking entry counts...[/dim]")
-        for session_id in fs_session_ids & db_sessions:
-            # Count entries in file
-            file_path = fs_sessions[session_id]
-            try:
-                with open(file_path, 'r') as f:
-                    file_entries = sum(1 for line in f if line.strip())
-            except:
-                continue
-
-            # Count entries in DB
-            cursor.execute("""
-                SELECT COUNT(*) FROM transcript_entries WHERE session_id = ?
-            """, (session_id,))
-            db_entries = cursor.fetchone()[0]
-
-            if file_entries != db_entries and db_entries > 0:
-                out_of_sync.append({
-                    'session_id': session_id,
-                    'file_entries': file_entries,
-                    'db_entries': db_entries,
-                    'diff': file_entries - db_entries
-                })
+        out_of_sync = check_entry_count_mismatches(cursor, fs_sessions, db_sessions)
 
     conn.close()
 
-    # 5. Display results
+    # 4. Display results
     console.print("")
 
     if not missing_in_db and not orphaned_with_content and not orphaned_empty and not out_of_sync:
         console.print("[green]✅ No discrepancies found! Database is in sync with filesystem.[/green]")
         return
 
-    # Missing sessions (in filesystem, not in DB)
-    if missing_in_db:
-        console.print(Panel(
-            f"[yellow]{len(missing_in_db)}[/yellow] sessions exist in filesystem but not in database",
-            title="[bold yellow]Missing in Database[/bold yellow]",
-            border_style="yellow"
-        ))
-        if verbose:
-            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
-            table.add_column("Session ID", style="cyan")
-            table.add_column("File Path", style="dim")
-            for session_id in sorted(list(missing_in_db))[:20]:
-                table.add_row(session_id[:12] + "...", fs_sessions[session_id])
-            if len(missing_in_db) > 20:
-                table.add_row(f"... and {len(missing_in_db) - 20} more", "")
-            console.print(table)
-        console.print("")
-
-    # Orphaned sessions with content (recoverable via --orphans)
-    if orphaned_with_content:
-        console.print(Panel(
-            f"[green]{len(orphaned_with_content)}[/green] sessions recoverable (file deleted but content preserved in vault)",
-            title="[bold green]Orphaned - Recoverable[/bold green]",
-            border_style="green"
-        ))
-        if verbose:
-            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
-            table.add_column("Session ID", style="cyan")
-            for session_id in sorted(list(orphaned_with_content))[:20]:
-                table.add_row(session_id[:12] + "...")
-            if len(orphaned_with_content) > 20:
-                table.add_row(f"... and {len(orphaned_with_content) - 20} more")
-            console.print(table)
-        console.print("[dim]View with: claude-vault browse --orphans[/dim]")
-        console.print("")
-
-    # Orphaned sessions without content (empty shells, can be cleaned up)
-    if orphaned_empty:
-        console.print(Panel(
-            f"[dim]{len(orphaned_empty)}[/dim] empty sessions (file deleted, no content in vault)",
-            title="[dim]Orphaned - Empty[/dim]",
-            border_style="dim"
-        ))
-        if verbose:
-            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
-            table.add_column("Session ID", style="dim")
-            for session_id in sorted(list(orphaned_empty))[:10]:
-                table.add_row(session_id[:12] + "...")
-            if len(orphaned_empty) > 10:
-                table.add_row(f"... and {len(orphaned_empty) - 10} more")
-            console.print(table)
-        console.print("")
-
-    # Out of sync sessions
-    if out_of_sync:
-        console.print(Panel(
-            f"[magenta]{len(out_of_sync)}[/magenta] sessions have different entry counts",
-            title="[bold magenta]Out of Sync[/bold magenta]",
-            border_style="magenta"
-        ))
-        if verbose:
-            table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
-            table.add_column("Session ID", style="cyan")
-            table.add_column("File", justify="right")
-            table.add_column("DB", justify="right")
-            table.add_column("Diff", justify="right")
-            for item in sorted(out_of_sync, key=lambda x: abs(x['diff']), reverse=True)[:20]:
-                diff_style = "green" if item['diff'] > 0 else "red"
-                table.add_row(
-                    item['session_id'][:12] + "...",
-                    str(item['file_entries']),
-                    str(item['db_entries']),
-                    f"[{diff_style}]{item['diff']:+d}[/{diff_style}]"
-                )
-            console.print(table)
-        console.print("")
+    display_check_missing(missing_in_db, fs_sessions, verbose)
+    display_check_orphaned(orphaned_with_content, orphaned_empty, verbose)
+    display_check_out_of_sync(out_of_sync, verbose)
 
     # Summary
     summary_parts = []
@@ -1111,26 +1270,7 @@ def check(fix: bool, verbose: bool):
     # Fix option
     if fix and missing_in_db:
         console.print("")
-        console.print("[cyan]Syncing missing sessions...[/cyan]")
-
-        from claude_vault.db import sync_transcript_entries, rebuild_sessions_from_transcripts
-
-        synced_count = 0
-        with console.status("[bold green]Syncing...") as status:
-            for session_id in missing_in_db:
-                file_path = fs_sessions[session_id]
-                try:
-                    entries = sync_transcript_entries(session_id, file_path)
-                    if entries > 0:
-                        synced_count += 1
-                        status.update(f"[bold green]Synced {synced_count} sessions...")
-                except Exception as e:
-                    if verbose:
-                        console.print(f"[red]Error syncing {session_id[:8]}: {e}[/red]")
-
-        rebuild_sessions_from_transcripts()
-        console.print(f"[green]✅ Synced {synced_count} missing sessions[/green]")
-
+        fix_missing_sessions(missing_in_db, fs_sessions, verbose)
     elif missing_in_db and not fix:
         console.print("")
         console.print("[dim]Tip: Run [cyan]claude-vault check --fix[/cyan] to sync missing sessions[/dim]")
