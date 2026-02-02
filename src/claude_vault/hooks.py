@@ -25,6 +25,45 @@ def process_hook_input() -> dict:
         return {}
 
 
+def find_active_transcript(session_id: str, reported_path: str) -> str:
+    """Find the actively written transcript file for a session.
+
+    After compaction, Claude may report the old transcript_path but write to a new file.
+    This function detects stale paths and finds the active one.
+    """
+    from pathlib import Path
+    import time
+
+    reported = Path(reported_path)
+    if not reported.exists():
+        return reported_path
+
+    # Check if the reported file is being actively written
+    # (modified in the last 60 seconds)
+    file_mtime = reported.stat().st_mtime
+    if time.time() - file_mtime < 60:
+        return reported_path
+
+    # The reported file is stale - look for a newer file in the same directory
+    project_dir = reported.parent
+    newest_file = None
+    newest_mtime = 0
+
+    for jsonl_file in project_dir.glob("*.jsonl"):
+        # Skip subagent files
+        if jsonl_file.stem.startswith('agent-'):
+            continue
+        mtime = jsonl_file.stat().st_mtime
+        if mtime > newest_mtime:
+            newest_mtime = mtime
+            newest_file = jsonl_file
+
+    if newest_file and newest_mtime > file_mtime:
+        return str(newest_file)
+
+    return reported_path
+
+
 def sync_in_background(session_id: str, transcript_path: str):
     """Spawn a background process to sync transcript entries after a small delay.
 
@@ -33,18 +72,24 @@ def sync_in_background(session_id: str, transcript_path: str):
     """
     import subprocess
 
-    # Build the sync command - use the installed claude-vault CLI
-    # The sync command with -s option syncs a specific session
+    # Find the active transcript (handles post-compaction case)
+    active_path = find_active_transcript(session_id, transcript_path)
+
+    # Extract session ID from the active file (may differ after compaction)
+    from pathlib import Path
+    active_session_id = Path(active_path).stem
+
+    # Sync the active session
     try:
         subprocess.Popen(
-            ['sh', '-c', f'sleep 0.5 && claude-vault sync -s {session_id[:8]} >/dev/null 2>&1'],
+            ['sh', '-c', f'sleep 0.5 && claude-vault sync -s {active_session_id[:8]} >/dev/null 2>&1'],
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except Exception:
         # If subprocess fails, fall back to synchronous sync
-        sync_transcript_entries(session_id, transcript_path)
+        sync_transcript_entries(active_session_id, active_path)
 
 
 def main():
