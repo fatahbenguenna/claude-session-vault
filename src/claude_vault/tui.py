@@ -1065,6 +1065,7 @@ class SessionBrowser(App):
     def on_mount(self) -> None:
         """Initialize with async loading."""
         init_db()
+        self._update_footer()  # Set correct footer based on orphans_only mode
         self._load_sessions_async()
 
     @work(exclusive=True, thread=True)
@@ -1393,6 +1394,9 @@ class SessionBrowser(App):
         self.orphans_only = not self.orphans_only
         self.loading = True
 
+        # Update footer to reflect new mode
+        self._update_footer()
+
         # Show loading indicator
         loading = self.query_one("#loading-container", Container)
         tree = self.query_one("#session-tree", Tree)
@@ -1405,6 +1409,12 @@ class SessionBrowser(App):
 
         # Reload sessions
         self._load_sessions_async()
+
+    def _update_footer(self) -> None:
+        """Update footer text based on current mode."""
+        footer = self.query_one("#footer", Static)
+        toggle_label = "^O:all" if self.orphans_only else "^O:orphans"
+        footer.update(f"↑↓:nav · ←→:fold · ^A:fold all · {toggle_label} · Enter:select · ^V:preview · ^E:export")
 
     def _is_navigable_node(self, node) -> bool:
         """Check if node is navigable (session or project group, not metadata)."""
