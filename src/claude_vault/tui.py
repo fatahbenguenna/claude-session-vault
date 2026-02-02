@@ -1028,7 +1028,7 @@ class SessionBrowser(App):
     def compose(self) -> ComposeResult:
         header_text = "Orphaned Sessions (deleted by Claude)" if self.orphans_only else "Browse Sessions"
         yield Static(header_text, id="header")
-        yield Container(Input(placeholder="🔍 Type to search...", id="search-input"), id="search-box")
+        yield Container(Input(placeholder="🔍 Loading...", id="search-input", disabled=True), id="search-box")
         yield Container(
             LoadingIndicator(),
             Static("Loading sessions...", id="loading-text"),
@@ -1067,6 +1067,11 @@ class SessionBrowser(App):
         tree = self.query_one("#session-tree", Tree)
         loading.add_class("hidden")
         tree.remove_class("hidden")
+
+        # Enable search input
+        search_input = self.query_one("#search-input", Input)
+        search_input.disabled = False
+        search_input.placeholder = "🔍 Type to search..."
 
         # Build tree and focus
         try:
@@ -1368,9 +1373,11 @@ class SessionBrowser(App):
         tree.add_class("hidden")
         loading.remove_class("hidden")
 
-        # Clear search
+        # Clear and disable search during reload
         search_input = self.query_one("#search-input", Input)
         search_input.value = ""
+        search_input.disabled = True
+        search_input.placeholder = "🔍 Loading..."
 
         # Reload sessions
         self._load_sessions_async()
