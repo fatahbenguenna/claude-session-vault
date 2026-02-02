@@ -2,6 +2,7 @@
 """Hook script for Claude Code events - called by Claude Code hooks."""
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,36 @@ def process_hook_input() -> dict:
         return json.loads(raw_input)
     except json.JSONDecodeError:
         return {}
+
+
+def sync_in_background(session_id: str, transcript_path: str):
+    """Spawn a background process to sync transcript entries after a small delay.
+
+    This allows Claude to finish writing to the JSONL file before we read it.
+    """
+    try:
+        # Fork a child process
+        pid = os.fork()
+        if pid > 0:
+            # Parent process - return immediately
+            return
+
+        # Child process - detach and sync after delay
+        os.setsid()  # Create new session
+
+        # Wait a bit for Claude to finish writing
+        import time
+        time.sleep(0.5)
+
+        # Now sync the transcript
+        sync_transcript_entries(session_id, transcript_path)
+
+        # Exit child process
+        os._exit(0)
+
+    except OSError:
+        # Fork failed, fall back to synchronous sync
+        sync_transcript_entries(session_id, transcript_path)
 
 
 def main():
@@ -62,14 +93,14 @@ def main():
             if input_data.get('session_id'):
                 end_session(input_data['session_id'])
 
-        # Insert event into database
+        # Insert event into database (synchronous - fast)
         insert_event(event)
 
-        # Sync transcript entries incrementally
+        # Sync transcript entries in background (after delay for Claude to finish writing)
         session_id = input_data.get('session_id')
         transcript_path = input_data.get('transcript_path')
         if session_id and transcript_path:
-            sync_transcript_entries(session_id, transcript_path)
+            sync_in_background(session_id, transcript_path)
 
         # Output empty JSON to not block Claude
         print(json.dumps({}))
