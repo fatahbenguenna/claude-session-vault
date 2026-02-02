@@ -19,6 +19,7 @@ src/claude_vault/
 ├── cli.py          # Main CLI entry point (Click commands)
 ├── db.py           # Database operations (SQLite + FTS5)
 ├── tui.py          # Interactive TUI browser (Textual)
+├── utils.py        # Shared utility functions
 ├── hooks.py        # Claude Code hooks handler
 ├── installer.py    # Installation utilities
 └── mcp_server.py   # MCP server functionality
@@ -28,9 +29,10 @@ src/claude_vault/
 
 | Module | Purpose |
 |--------|---------|
-| `cli.py` | Click-based CLI with commands: browse, search, sessions, show, export, sync, stats |
-| `db.py` | SQLite operations with FTS5 virtual tables for fast full-text search |
+| `cli.py` | Click-based CLI with commands: browse, search, sessions, show, export, sync, stats, check |
+| `db.py` | SQLite operations with FTS5 virtual tables, context manager for safe DB access |
 | `tui.py` | Textual-based interactive browser with fuzzy search and keyboard navigation |
+| `utils.py` | Shared helpers: datetime parsing, content extraction, path decoding, session file lookup |
 | `hooks.py` | Processes Claude Code hook events (SessionStart, UserPromptSubmit, PostToolUse, SessionEnd) |
 | `installer.py` | Configures Claude Code settings.json with required hooks |
 
@@ -67,10 +69,12 @@ claude-vault sync --all      # Sync all JSONL files
 ## Code Conventions
 
 - **CLI Commands**: Use Click decorators with explicit help text and examples
-- **Database**: Always use `get_connection()` for SQLite connections with Row factory
+- **Database**: Prefer `db_cursor()` context manager for safe DB operations
+- **Utilities**: Use functions from `utils.py` for datetime parsing, content extraction, etc.
 - **Error Handling**: Use Rich console for user-friendly error messages
 - **Type Hints**: Required for all function signatures
 - **Docstrings**: Required for all public functions
+- **DRY Principle**: Extract shared logic to `utils.py` to avoid duplication
 
 ## Entry Points
 
