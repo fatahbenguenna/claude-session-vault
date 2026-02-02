@@ -29,29 +29,21 @@ def sync_in_background(session_id: str, transcript_path: str):
     """Spawn a background process to sync transcript entries after a small delay.
 
     This allows Claude to finish writing to the JSONL file before we read it.
+    Uses subprocess to ensure it works in managed environments (pipx, uv).
     """
+    import subprocess
+
+    # Build the sync command - use the installed claude-vault CLI
+    # The sync command with -s option syncs a specific session
     try:
-        # Fork a child process
-        pid = os.fork()
-        if pid > 0:
-            # Parent process - return immediately
-            return
-
-        # Child process - detach and sync after delay
-        os.setsid()  # Create new session
-
-        # Wait a bit for Claude to finish writing
-        import time
-        time.sleep(0.5)
-
-        # Now sync the transcript
-        sync_transcript_entries(session_id, transcript_path)
-
-        # Exit child process
-        os._exit(0)
-
-    except OSError:
-        # Fork failed, fall back to synchronous sync
+        subprocess.Popen(
+            ['sh', '-c', f'sleep 0.5 && claude-vault sync -s {session_id[:8]} >/dev/null 2>&1'],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # If subprocess fails, fall back to synchronous sync
         sync_transcript_entries(session_id, transcript_path)
 
 
