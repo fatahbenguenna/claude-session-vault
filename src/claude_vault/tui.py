@@ -126,21 +126,48 @@ def get_session_title(session_id: str, transcript_path: Optional[str] = None) ->
     return f"Session {session_id[:8]}"
 
 
-def get_session_preview(session_id: str, transcript_path: Optional[str] = None, max_messages: int = 20) -> str:
-    """Get a formatted preview of the session content like Claude Code display."""
+def get_session_preview(
+    session_id: str,
+    transcript_path: Optional[str] = None,
+    max_messages: int = 20,
+    offset: int = 0
+) -> Tuple[str, int, int]:
+    """Get a formatted preview of the session content like Claude Code display.
+
+    Args:
+        session_id: The session ID to preview
+        transcript_path: Optional path to transcript file
+        max_messages: Maximum messages to return
+        offset: Number of messages to skip (for pagination)
+
+    Returns:
+        Tuple of (preview_text, total_entries, loaded_count)
+    """
     from claude_vault.db import get_transcript_entries
 
     lines = []
 
     # Try transcript_entries from database first (synced content)
     entries = get_transcript_entries(session_id)
+    total_entries = len(entries) if entries else 0
+
     if entries:
         message_count = 0
+        skipped = 0
         for entry in entries:
+            # Skip entries for pagination
+            if skipped < offset:
+                raw_json = entry.get('raw_json', '')
+                if raw_json:
+                    try:
+                        data = json.loads(raw_json)
+                        if data.get('type') in ('user', 'human', 'assistant'):
+                            skipped += 1
+                    except:
+                        pass
+                continue
+
             if message_count >= max_messages:
-                remaining = len(entries) - message_count
-                if remaining > 0:
-                    lines.append(f"\n[dim]... and {remaining} more entries[/dim]")
                 break
 
             raw_json = entry.get('raw_json', '')
@@ -218,10 +245,12 @@ def get_session_preview(session_id: str, transcript_path: Optional[str] = None, 
                 continue
 
         if lines:
-            return '\n'.join(lines)
+            loaded_count = offset + message_count
+            return '\n'.join(lines), total_entries, loaded_count
 
     # Fallback: database events (from hooks)
     events = get_session_events(session_id, limit=max_messages)
+    total_events = len(events) if events else 0
     if events:
         for event in events:
             if event.get('event_type') == 'UserPromptSubmit' and event.get('prompt'):
@@ -232,7 +261,10 @@ def get_session_preview(session_id: str, transcript_path: Optional[str] = None, 
             elif event.get('tool_name'):
                 lines.append(f"[bold yellow]⚡ {event['tool_name']}[/bold yellow]")
 
-    return '\n'.join(lines) if lines else "[dim]No conversation content in this session.\n\nThis session may only contain metadata (file snapshots, etc.)\nor the transcript was not synced yet.\n\nTry: claude-vault sync --all[/dim]"
+    if lines:
+        return '\n'.join(lines), total_events, len(events)
+
+    return "[dim]No conversation content in this session.\n\nThis session may only contain metadata (file snapshots, etc.)\nor the transcript was not synced yet.\n\nTry: claude-vault sync --all[/dim]", 0, 0
 
 
 def get_enriched_sessions(limit: int = 100) -> List[Dict[str, Any]]:
@@ -476,6 +508,7 @@ class PreviewScreen(ModalScreen):
         Binding("ctrl+f", "toggle_search", "Find", show=False),
         Binding("f3", "find_next", "Next", show=False),
         Binding("shift+f3", "find_prev", "Prev", show=False),
+        Binding("m", "load_more", "Load more", show=False),
     ]
 
     CSS = """
@@ -570,18 +603,29 @@ class PreviewScreen(ModalScreen):
         self.current_match_index = 0
         self.raw_preview = ""  # Store raw preview content
         self.preview_lines: List[str] = []  # Lines for search
+        self.loaded_count = 0  # Number of messages loaded
+        self.total_entries = 0  # Total entries available
+        self.page_size = 50  # Messages per page
 
     def compose(self) -> ComposeResult:
-        self.raw_preview = get_session_preview(
+        self.raw_preview, self.total_entries, self.loaded_count = get_session_preview(
             self.session['session_id'],
             self.session.get('transcript_path'),
-            max_messages=50  # Show more messages in full preview
+            max_messages=self.page_size,
+            offset=0
         )
         self.preview_lines = self.raw_preview.split('\n')
 
         title = self.session.get('custom_name') or self.session.get('title', 'Session')
         if len(title) > 60:
             title = title[:60] + "..."
+
+        # Build footer with load more info
+        remaining = self.total_entries - self.loaded_count
+        if remaining > 0:
+            footer_text = f"↑↓:Scroll · m:Load more ({remaining}) · Ctrl+F:Find · e:Export · o:Open · Esc:Close"
+        else:
+            footer_text = "↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close"
 
         yield Container(
             Static(f"📋 {title}", id="preview-title"),
@@ -596,8 +640,8 @@ class PreviewScreen(ModalScreen):
                 Static(self.raw_preview, id="preview-content", markup=True),
                 id="preview-scroll"
             ),
-            Static("", id="preview-status"),
-            Static("↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close", id="preview-footer"),
+            Static(f"[dim]{self.loaded_count} of {self.total_entries} entries[/dim]" if self.total_entries > 0 else "", id="preview-status"),
+            Static(footer_text, id="preview-footer"),
             id="preview-dialog"
         )
 
@@ -655,6 +699,45 @@ class PreviewScreen(ModalScreen):
     def action_close(self) -> None:
         """Close the preview and return to session list."""
         self.dismiss()
+
+    def action_load_more(self) -> None:
+        """Load more messages into the preview."""
+        remaining = self.total_entries - self.loaded_count
+        if remaining <= 0:
+            return
+
+        # Load next page
+        new_preview, _, new_loaded = get_session_preview(
+            self.session['session_id'],
+            self.session.get('transcript_path'),
+            max_messages=self.page_size,
+            offset=self.loaded_count
+        )
+
+        if new_preview and not new_preview.startswith("[dim]No conversation"):
+            # Append new content
+            self.raw_preview += "\n" + new_preview
+            self.loaded_count = new_loaded
+            self.preview_lines = self.raw_preview.split('\n')
+
+            # Update display
+            preview_content = self.query_one("#preview-content", Static)
+            preview_content.update(self.raw_preview)
+
+            # Update status and footer
+            remaining = self.total_entries - self.loaded_count
+            status = self.query_one("#preview-status", Static)
+            status.update(f"[dim]{self.loaded_count} of {self.total_entries} entries[/dim]")
+
+            footer = self.query_one("#preview-footer", Static)
+            if remaining > 0:
+                footer.update(f"↑↓:Scroll · m:Load more ({remaining}) · Ctrl+F:Find · e:Export · o:Open · Esc:Close")
+            else:
+                footer.update("↑↓:Scroll · Ctrl+F:Find · e:Export · c:Copy · o/Enter:Open in Claude · Esc:Close")
+
+            # Scroll to show new content
+            scroll = self.query_one("#preview-scroll", VerticalScroll)
+            scroll.scroll_end(animate=True)
 
     @on(Input.Changed, "#preview-search-input")
     def on_search_changed(self, event: Input.Changed) -> None:
